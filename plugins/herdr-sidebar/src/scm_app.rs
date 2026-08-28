@@ -3123,11 +3123,11 @@ impl App {
     fn draw_button(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Commit;
         let bg = if focused {
-            palette().accent_focus
+            palette().button_focus_bg
         } else {
-            palette().accent
+            palette().button_bg
         };
-        let mut style = Style::default().bg(bg).fg(palette().accent_fg);
+        let mut style = Style::default().bg(bg).fg(palette().button_fg);
         if focused {
             style = style.add_modifier(Modifier::BOLD);
         }
@@ -3625,8 +3625,8 @@ fn message_box_item(
 /// right end; only the active repo's button is fully lit.
 fn commit_button_item(active: bool, focused: bool, width: usize) -> ListItem<'static> {
     let (bg, fg) = match (active, focused) {
-        (true, true) => (palette().accent_focus, palette().accent_fg),
-        (true, false) => (palette().accent, palette().accent_fg),
+        (true, true) => (palette().button_focus_bg, palette().button_fg),
+        (true, false) => (palette().button_bg, palette().button_fg),
         (false, _) => (palette().muted_button_bg, palette().muted_button_fg),
     };
     let label = "✓ Commit";
@@ -3667,8 +3667,8 @@ fn section_item(
     let badge = Span::styled(
         format!(" {count} "),
         Style::default()
-            .bg(palette().accent)
-            .fg(palette().accent_fg),
+            .bg(palette().button_bg)
+            .fg(palette().button_fg),
     );
     // Hovering shows the section-wide stage/unstage glyph before the badge.
     let action_span = action.map(|a| Span::styled(format!("{a} "), Style::default().bold()));

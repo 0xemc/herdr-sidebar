@@ -271,10 +271,13 @@ through — `ColorTheme::next()` is a rotation, not a toggle):
   colors until it reloads; diffs re-render on their own ~2s refresh.
 - **A named color is the terminal profile's color, so it is not safe on a filled button**:
   `accent_fg: Color::White` emits ANSI 15, which a light profile draws as a pale grey — ✓ Commit
-  and the Changes count badge read grey-on-blue (user-reported). The light palette states pure
-  `Rgb(255,255,255)` instead, and its button fill is VS Code light's `#0078d4`. Sync Changes sits
-  on `sync_bg`, not on the accent, so it has its own `sync_fg` — it used to borrow `accent_fg`,
-  i.e. white on a light grey button.
+  and the Changes count badge read grey-on-blue (user-reported). Filled buttons now take
+  `button_bg`/`button_focus_bg`/`button_fg`, stated in RGB: the dark themes keep the solid accent
+  fill, and the light theme uses a soft tint (`#d8eafc`, focus `#b6d8f8`) with `#0a4a86` text,
+  because a saturated blue block dominates a white pane (user-rejected). `accent` stays what it
+  always was — the focused message-box BORDER — and must not be repurposed as a fill. Sync Changes
+  sits on `sync_bg`, not on a button fill, so it has its own `sync_fg`; it used to borrow the
+  button's white, i.e. white on a light grey button.
 - Icon colors (`icons::material`) stay ONE table; `ui::icon_style` caps their relative
   luminance for light backgrounds instead of a second table that would drift.
 - **The `--preview` viewer is its own process and used to skip `set_color_theme` entirely**

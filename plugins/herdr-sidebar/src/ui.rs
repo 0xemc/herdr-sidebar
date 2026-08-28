@@ -31,13 +31,18 @@ pub struct Palette {
     pub hover_bg: Color,
     pub accent: Color,
     pub accent_focus: Color,
-    pub accent_fg: Color,
+    /// Filled buttons (✓ Commit, the section count badge). The dark themes
+    /// fill them with the accent; the light theme uses a soft tint with dark
+    /// blue text, because a saturated blue block dominates a white pane.
+    pub button_bg: Color,
+    pub button_focus_bg: Color,
+    pub button_fg: Color,
     pub muted_button_bg: Color,
     pub muted_button_fg: Color,
     pub sync_bg: Color,
     pub sync_busy_bg: Color,
     /// Sync Changes' label. It sits on `sync_bg`, NOT on the accent, so it
-    /// cannot borrow `accent_fg` — white on a light grey button is invisible.
+    /// cannot borrow `button_fg` — white on a light grey button is invisible.
     pub sync_fg: Color,
     pub header_accent: Color,
     /// Row foregrounds that go with the three row backgrounds above.
@@ -78,7 +83,9 @@ const VSCODE_PALETTE: Palette = Palette {
     hover_bg: Color::Rgb(48, 52, 60),
     accent: Color::Rgb(0x00, 0x78, 0xd4),
     accent_focus: Color::Rgb(0x02, 0x8a, 0xf0),
-    accent_fg: Color::White,
+    button_bg: Color::Rgb(0x00, 0x78, 0xd4),
+    button_focus_bg: Color::Rgb(0x02, 0x8a, 0xf0),
+    button_fg: Color::White,
     muted_button_bg: Color::Rgb(0x24, 0x45, 0x5c),
     muted_button_fg: Color::Rgb(0x9a, 0xb2, 0xc2),
     sync_bg: Color::Rgb(0x3a, 0x3d, 0x41),
@@ -116,11 +123,15 @@ const LIGHT_PALETTE: Palette = Palette {
     hover_bg: Color::Rgb(0xec, 0xec, 0xec),
     accent: Color::Rgb(0x00, 0x78, 0xd4),
     accent_focus: Color::Rgb(0x02, 0x6e, 0xc1),
-    // NOT `Color::White`: that is ANSI 15, which a light terminal profile
-    // renders as a pale grey — the Commit button then reads grey-on-blue.
-    accent_fg: Color::Rgb(0xff, 0xff, 0xff),
-    muted_button_bg: Color::Rgb(0xdb, 0xe9, 0xf5),
-    muted_button_fg: Color::Rgb(0x2c, 0x57, 0x77),
+    // A soft fill with dark blue text instead of a solid blue block, and NEVER
+    // `Color::White`: that is ANSI 15, which a light profile draws as a pale
+    // grey — the old solid button read grey-on-blue.
+    button_bg: Color::Rgb(0xd8, 0xea, 0xfc),
+    button_focus_bg: Color::Rgb(0xb6, 0xd8, 0xf8),
+    button_fg: Color::Rgb(0x0a, 0x4a, 0x86),
+    // The inactive repo's button must stay clearly weaker than that tint.
+    muted_button_bg: Color::Rgb(0xec, 0xef, 0xf2),
+    muted_button_fg: Color::Rgb(0x57, 0x61, 0x6b),
     sync_bg: Color::Rgb(0xdc, 0xdf, 0xe3),
     sync_busy_bg: Color::Rgb(0xeb, 0xed, 0xef),
     sync_fg: Color::Rgb(0x24, 0x29, 0x2f),
@@ -153,7 +164,9 @@ const TERMINAL_PALETTE: Palette = Palette {
     hover_bg: Color::Black,
     accent: Color::Blue,
     accent_focus: Color::LightBlue,
-    accent_fg: Color::White,
+    button_bg: Color::Blue,
+    button_focus_bg: Color::LightBlue,
+    button_fg: Color::White,
     muted_button_bg: Color::Black,
     muted_button_fg: Color::Gray,
     sync_bg: Color::DarkGray,
@@ -657,6 +670,7 @@ mod tests {
             light.header_accent,
             light.accent,
             light.muted_button_fg,
+            light.button_fg,
             light.sync_fg,
             light.warning,
             light.diff_del_mark,
@@ -678,16 +692,19 @@ mod tests {
             light.diff_add_word_bg,
             light.sync_bg,
             light.muted_button_bg,
+            light.button_bg,
+            light.button_focus_bg,
         ] {
             assert!(luma(bg) > 0.6, "background {bg:?} is too dark for white");
         }
-        // The accent is a BUTTON FILL here, so its own label must be stated in
-        // RGB: `Color::White` is ANSI 15, which a light terminal profile draws
-        // as a pale grey and turns ✓ Commit into grey-on-blue.
-        assert_eq!(light.accent_fg, Color::Rgb(0xff, 0xff, 0xff));
+        // ✓ Commit is a soft tint with dark blue text here, so the pair must
+        // hold together on its own — and the label may never be a NAMED color:
+        // `Color::White` is ANSI 15, which a light profile draws as pale grey.
+        assert!(luma(light.button_bg) > 0.6 && luma(light.button_focus_bg) > 0.6);
+        assert!(luma(light.button_fg) < 0.35);
         assert!(
-            luma(light.accent) < 0.5,
-            "the commit button fill must stay dark enough for white text"
+            luma(light.muted_button_bg) > luma(light.button_bg),
+            "the inactive repo's button must read weaker than the active one"
         );
     }
 
