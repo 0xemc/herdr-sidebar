@@ -112,6 +112,10 @@ fn main() -> std::io::Result<()> {
                 );
                 std::process::exit(2);
             };
+            // The viewer is its own process: it must apply the persisted
+            // color theme itself, or a preview pane keeps the default palette
+            // (and a dark syntax theme) whatever the user chose.
+            herdr_sidebar::ui::set_color_theme(state::load_state().color_theme);
             return viewer::run(std::path::Path::new(&control));
         }
         Some("--view") => {}

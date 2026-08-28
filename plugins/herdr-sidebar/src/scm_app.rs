@@ -29,10 +29,10 @@ use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::suggest;
 use herdr_sidebar::ui::{
     TitleAction, activity_icons, branch_icon, draw_scrollbar, gear_icon, hits,
-    hits_collapse_button, hover_style, keep_visible_scroll, palette, selection_style,
-    set_color_theme, sibling_panes_of, sparkle_icon, status_color, title_action_spans,
-    title_actions_visible, title_actions_width, truncate_to, within, wrap_footer_message,
-    wrap_hints,
+    hits_collapse_button, hover_style, icon_style as ui_icon_style, keep_visible_scroll, palette,
+    selection_style, set_color_theme, sibling_panes_of, sparkle_icon, status_color,
+    title_action_spans, title_actions_visible, title_actions_width, truncate_to, within,
+    wrap_footer_message, wrap_hints,
 };
 
 /// How many log lines the history-ish drawers fetch.
@@ -1882,7 +1882,7 @@ impl App {
             Setting::IconTheme => self.set_theme(self.theme.toggled()),
             Setting::ColorTheme => {
                 self.sidebar_state = sidebar::update_state(|state| {
-                    state.color_theme = state.color_theme.other();
+                    state.color_theme = state.color_theme.next();
                 });
                 set_color_theme(self.sidebar_state.color_theme);
             }
@@ -3720,10 +3720,7 @@ fn file_item(
     };
     let color = status_color(entry.letter);
     let file_icon = icon(theme, name, false, false);
-    let icon_style = match file_icon.rgb {
-        Some((r, g, b)) => Style::default().fg(Color::Rgb(r, g, b)),
-        None => Style::default(),
-    };
+    let icon_style = ui_icon_style(file_icon.rgb);
     let mut spans = vec![
         Span::raw("   "),
         Span::styled(format!("{} ", file_icon.glyph), icon_style),

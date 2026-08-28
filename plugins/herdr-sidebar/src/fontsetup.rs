@@ -415,7 +415,7 @@ fn done_err_lines(err: &str, copied: bool, width: u16, height: usize) -> Vec<Lin
                 3,
                 [
                     wrapped("Install it manually by running:", width, Style::default()),
-                    wrapped(MANUAL_CMD, width, Style::default().fg(Color::Yellow)),
+                    wrapped(MANUAL_CMD, width, Style::default().fg(palette().warning)),
                 ]
                 .concat(),
             ),

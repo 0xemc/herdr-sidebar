@@ -134,10 +134,13 @@ impl View {
 }
 
 /// Accent palette for the sidebar. `VsCode` preserves the historical RGB
-/// styling; `Terminal` uses ANSI colors so the terminal profile remaps them.
+/// styling, which assumes a DARK terminal background; `Light` is its
+/// light-background counterpart; `Terminal` uses ANSI colors so the terminal
+/// profile remaps them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ColorTheme {
     VsCode,
+    Light,
     Terminal,
 }
 
@@ -145,20 +148,31 @@ impl ColorTheme {
     pub fn label(self) -> &'static str {
         match self {
             Self::VsCode => "vscode",
+            Self::Light => "light",
             Self::Terminal => "terminal",
         }
     }
 
-    pub fn other(self) -> Self {
+    /// The Settings row cycles through every theme — a rotation, not a
+    /// two-way toggle.
+    pub fn next(self) -> Self {
         match self {
-            Self::VsCode => Self::Terminal,
+            Self::VsCode => Self::Light,
+            Self::Light => Self::Terminal,
             Self::Terminal => Self::VsCode,
         }
+    }
+
+    /// This palette is drawn for a LIGHT terminal background: the preview's
+    /// syntax theme, diff tints and icon colors follow it.
+    pub fn is_light(self) -> bool {
+        self == Self::Light
     }
 
     fn from_state_name(name: &str) -> Option<Self> {
         match name {
             "vscode" => Some(Self::VsCode),
+            "light" => Some(Self::Light),
             "terminal" => Some(Self::Terminal),
             _ => None,
         }
@@ -958,6 +972,24 @@ mod tests {
         assert_eq!(
             parse_state("{\"merged\":true}").color_theme,
             ColorTheme::VsCode
+        );
+        // The Settings row cycles all three themes and comes back around, and
+        // every label round-trips through the state file.
+        let mut theme = ColorTheme::VsCode;
+        for expected in [ColorTheme::Light, ColorTheme::Terminal, ColorTheme::VsCode] {
+            theme = theme.next();
+            assert_eq!(theme, expected);
+            assert_eq!(ColorTheme::from_state_name(theme.label()), Some(theme));
+        }
+        assert_eq!(
+            parse_state("{\"colors\":\"light\"}").color_theme,
+            ColorTheme::Light
+        );
+        // An unknown name is not a light theme — it falls back to the default.
+        assert!(
+            !parse_state("{\"colors\":\"solarized\"}")
+                .color_theme
+                .is_light()
         );
         // Existing installs get neighbour following by default.
         assert!(parse_state("{\"merged\":true}").follow_cwd);
