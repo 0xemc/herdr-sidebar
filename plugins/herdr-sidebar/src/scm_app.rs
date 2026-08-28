@@ -3171,7 +3171,7 @@ impl App {
         } else {
             Style::default()
                 .bg(palette().sync_bg)
-                .fg(palette().accent_fg)
+                .fg(palette().sync_fg)
         };
         frame.render_widget(Paragraph::new(label).centered().style(style), area);
     }

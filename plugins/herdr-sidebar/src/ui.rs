@@ -36,6 +36,9 @@ pub struct Palette {
     pub muted_button_fg: Color,
     pub sync_bg: Color,
     pub sync_busy_bg: Color,
+    /// Sync Changes' label. It sits on `sync_bg`, NOT on the accent, so it
+    /// cannot borrow `accent_fg` — white on a light grey button is invisible.
+    pub sync_fg: Color,
     pub header_accent: Color,
     /// Row foregrounds that go with the three row backgrounds above.
     /// `Color::Reset` = keep the terminal's own foreground.
@@ -80,6 +83,7 @@ const VSCODE_PALETTE: Palette = Palette {
     muted_button_fg: Color::Rgb(0x9a, 0xb2, 0xc2),
     sync_bg: Color::Rgb(0x3a, 0x3d, 0x41),
     sync_busy_bg: Color::Rgb(0x2d, 0x2d, 0x33),
+    sync_fg: Color::White,
     header_accent: Color::LightBlue,
     selection_fg: Color::Reset,
     selection_unfocused_fg: Color::Reset,
@@ -110,13 +114,16 @@ const LIGHT_PALETTE: Palette = Palette {
     selection_bg: Color::Rgb(0xcc, 0xe3, 0xf5),
     selection_unfocused_bg: Color::Rgb(0xe4, 0xe6, 0xe8),
     hover_bg: Color::Rgb(0xec, 0xec, 0xec),
-    accent: Color::Rgb(0x00, 0x5f, 0xb8),
-    accent_focus: Color::Rgb(0x00, 0x78, 0xd4),
-    accent_fg: Color::White,
+    accent: Color::Rgb(0x00, 0x78, 0xd4),
+    accent_focus: Color::Rgb(0x02, 0x6e, 0xc1),
+    // NOT `Color::White`: that is ANSI 15, which a light terminal profile
+    // renders as a pale grey — the Commit button then reads grey-on-blue.
+    accent_fg: Color::Rgb(0xff, 0xff, 0xff),
     muted_button_bg: Color::Rgb(0xdb, 0xe9, 0xf5),
     muted_button_fg: Color::Rgb(0x2c, 0x57, 0x77),
     sync_bg: Color::Rgb(0xdc, 0xdf, 0xe3),
     sync_busy_bg: Color::Rgb(0xeb, 0xed, 0xef),
+    sync_fg: Color::Rgb(0x24, 0x29, 0x2f),
     header_accent: Color::Rgb(0x00, 0x58, 0xa8),
     selection_fg: Color::Rgb(0x0a, 0x0a, 0x0a),
     selection_unfocused_fg: Color::Rgb(0x1f, 0x1f, 0x1f),
@@ -151,6 +158,7 @@ const TERMINAL_PALETTE: Palette = Palette {
     muted_button_fg: Color::Gray,
     sync_bg: Color::DarkGray,
     sync_busy_bg: Color::Black,
+    sync_fg: Color::White,
     header_accent: Color::LightBlue,
     selection_fg: Color::White,
     selection_unfocused_fg: Color::White,
@@ -649,6 +657,7 @@ mod tests {
             light.header_accent,
             light.accent,
             light.muted_button_fg,
+            light.sync_fg,
             light.warning,
             light.diff_del_mark,
             light.diff_add_mark,
@@ -672,6 +681,14 @@ mod tests {
         ] {
             assert!(luma(bg) > 0.6, "background {bg:?} is too dark for white");
         }
+        // The accent is a BUTTON FILL here, so its own label must be stated in
+        // RGB: `Color::White` is ANSI 15, which a light terminal profile draws
+        // as a pale grey and turns ✓ Commit into grey-on-blue.
+        assert_eq!(light.accent_fg, Color::Rgb(0xff, 0xff, 0xff));
+        assert!(
+            luma(light.accent) < 0.5,
+            "the commit button fill must stay dark enough for white text"
+        );
     }
 
     #[test]

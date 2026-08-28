@@ -269,6 +269,12 @@ through — `ColorTheme::next()` is a rotation, not a toggle):
   washed-out case: `syntax::assets()` loads base16-ocean.dark AND InspiredGitHub and
   `syntaxes_and_theme()` picks per `ui::is_light()`. An already-highlighted preview keeps its
   colors until it reloads; diffs re-render on their own ~2s refresh.
+- **A named color is the terminal profile's color, so it is not safe on a filled button**:
+  `accent_fg: Color::White` emits ANSI 15, which a light profile draws as a pale grey — ✓ Commit
+  and the Changes count badge read grey-on-blue (user-reported). The light palette states pure
+  `Rgb(255,255,255)` instead, and its button fill is VS Code light's `#0078d4`. Sync Changes sits
+  on `sync_bg`, not on the accent, so it has its own `sync_fg` — it used to borrow `accent_fg`,
+  i.e. white on a light grey button.
 - Icon colors (`icons::material`) stay ONE table; `ui::icon_style` caps their relative
   luminance for light backgrounds instead of a second table that would drift.
 - **The `--preview` viewer is its own process and used to skip `set_color_theme` entirely**
