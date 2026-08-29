@@ -176,6 +176,19 @@ enum Overlay {
         rect: Rect,
         scroll: usize,
     },
+    QuickOpen {
+        query: String,
+        files: Vec<QuickFile>,
+        matches: Vec<usize>,
+        selected: usize,
+        truncated: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct QuickFile {
+    path: PathBuf,
+    label: String,
 }
 
 /// One row of the Settings modal.
@@ -699,6 +712,14 @@ impl App {
         {
             return Some(Exit::Quit);
         }
+        if key.code == KeyCode::Char('p')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+            && self.overlay.is_none()
+        {
+            self.open_quick_open();
+            return None;
+        }
         self.notice = None;
         if self.overlay.is_some() {
             self.overlay_key(key);
@@ -927,6 +948,7 @@ impl App {
             Close,
             Activate,
             ConfirmPrompt,
+            OpenQuick(PathBuf),
             ToggleSetting(usize),
             AdjustWidth(bool),
             DeleteConfirmed(PathBuf, bool),
@@ -987,6 +1009,44 @@ impl App {
                 KeyCode::Enter => Cmd::ConfirmPrompt,
                 _ => Cmd::Nothing,
             },
+            Some(Overlay::QuickOpen {
+                query,
+                files,
+                matches,
+                selected,
+                ..
+            }) => match key.code {
+                KeyCode::Esc => Cmd::Close,
+                KeyCode::Up => {
+                    *selected = selected.saturating_sub(1);
+                    Cmd::Nothing
+                }
+                KeyCode::Down => {
+                    *selected = (*selected + 1).min(matches.len().saturating_sub(1));
+                    Cmd::Nothing
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    *matches = quick_matches(files, query);
+                    *selected = 0;
+                    Cmd::Nothing
+                }
+                KeyCode::Enter => matches
+                    .get(*selected)
+                    .and_then(|index| files.get(*index))
+                    .map(|file| Cmd::OpenQuick(file.path.clone()))
+                    .unwrap_or(Cmd::Nothing),
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        || key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    query.push(c);
+                    *matches = quick_matches(files, query);
+                    *selected = 0;
+                    Cmd::Nothing
+                }
+                _ => Cmd::Nothing,
+            },
             Some(Overlay::ConfirmDelete { path, is_dir }) => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     Cmd::DeleteConfirmed(path.clone(), *is_dir)
@@ -1000,6 +1060,10 @@ impl App {
             Cmd::Close => self.overlay = None,
             Cmd::Activate => self.activate_menu_entry(),
             Cmd::ConfirmPrompt => self.confirm_prompt(),
+            Cmd::OpenQuick(path) => {
+                self.overlay = None;
+                self.open_preview(&path);
+            }
             Cmd::ToggleSetting(index) => self.toggle_setting(index),
             Cmd::AdjustWidth(wider) => self.adjust_sidebar_width(wider),
             Cmd::DeleteConfirmed(path, is_dir) => {
@@ -1124,6 +1188,22 @@ impl App {
             selected: 0,
             rect: Rect::default(),
             scroll: 0,
+        });
+    }
+
+    fn open_quick_open(&mut self) {
+        let (files, truncated) = collect_quick_files(
+            &self.tree.root_path(),
+            self.tree.show_hidden,
+            QUICK_OPEN_FILE_LIMIT,
+        );
+        let matches = quick_matches(&files, "");
+        self.overlay = Some(Overlay::QuickOpen {
+            query: String::new(),
+            files,
+            matches,
+            selected: 0,
+            truncated,
         });
     }
 
@@ -1927,6 +2007,7 @@ impl App {
         match self.overlay {
             Some(Overlay::Menu { .. }) => self.draw_menu(frame),
             Some(Overlay::Settings { .. }) => self.draw_settings(frame),
+            Some(Overlay::QuickOpen { .. }) => self.draw_quick_open(frame),
             _ => {}
         }
     }
@@ -2008,6 +2089,7 @@ impl App {
             ("r", "refresh"),
             (".", "dotfiles"),
             ("c", "folder"),
+            ("ctrl+p", "find"),
             ("m", "menu"),
             ("s", "settings"),
             ("b", "hide"),
@@ -2178,6 +2260,174 @@ impl App {
             popup,
         );
     }
+
+    fn draw_quick_open(&mut self, frame: &mut Frame) {
+        let Some(Overlay::QuickOpen {
+            query,
+            files,
+            matches,
+            selected,
+            truncated,
+        }) = self.overlay.as_ref()
+        else {
+            return;
+        };
+        let area = frame.area();
+        let width = area.width.clamp(1, 82);
+        let visible = usize::from(area.height.saturating_sub(5))
+            .min(matches.len())
+            .max(1);
+        let height = (visible as u16 + 5).min(area.height).max(1);
+        let popup = Rect::new(
+            (area.width.saturating_sub(width)) / 2,
+            (area.height.saturating_sub(height)) / 4,
+            width,
+            height,
+        );
+        let inner = popup.inner(ratatui::layout::Margin::new(1, 1));
+        let query_area = Rect::new(inner.x, inner.y, inner.width, inner.height.min(1));
+        let list_area = Rect::new(
+            inner.x,
+            inner.y.saturating_add(2),
+            inner.width,
+            inner.height.saturating_sub(3),
+        );
+        let start = selected.saturating_sub(usize::from(list_area.height).saturating_sub(1));
+        let items = matches
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(usize::from(list_area.height))
+            .filter_map(|(match_index, file_index)| {
+                let file = files.get(*file_index)?;
+                let label = truncate_to(
+                    file.label.clone(),
+                    usize::from(list_area.width).saturating_sub(1),
+                );
+                let line = Line::raw(format!(" {label}"));
+                Some(if match_index == *selected {
+                    ListItem::new(line).style(selection_style(true))
+                } else {
+                    ListItem::new(line)
+                })
+            })
+            .collect::<Vec<_>>();
+        let status = if matches.is_empty() {
+            "no matching files".to_string()
+        } else if *truncated {
+            format!(
+                "{} matches · first {QUICK_OPEN_FILE_LIMIT} files indexed",
+                matches.len()
+            )
+        } else {
+            format!("{} matches", matches.len())
+        };
+
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            ratatui::widgets::Block::bordered()
+                .title(" Quick Open ")
+                .border_style(Style::default().dim()),
+            popup,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" > ", Style::default().bold()),
+                Span::raw(query),
+                Span::styled("█", Style::default().dim()),
+            ])),
+            query_area,
+        );
+        frame.render_widget(List::new(items), list_area);
+        if inner.height > 1 {
+            frame.render_widget(
+                Paragraph::new(status.dim()).alignment(Alignment::Right),
+                Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
+            );
+        }
+    }
+}
+
+const QUICK_OPEN_FILE_LIMIT: usize = 20_000;
+
+fn collect_quick_files(root: &Path, show_hidden: bool, limit: usize) -> (Vec<QuickFile>, bool) {
+    let mut files = Vec::new();
+    let mut truncated = false;
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(!show_hidden)
+        .follow_links(false)
+        .require_git(false)
+        .filter_entry(|entry| entry.file_name() != ".git");
+    for entry in builder.build().flatten() {
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.into_path();
+        let label = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        files.push(QuickFile { path, label });
+        if files.len() >= limit {
+            truncated = true;
+            break;
+        }
+    }
+    files.sort_by_key(|file| file.label.to_lowercase());
+    (files, truncated)
+}
+
+fn quick_matches(files: &[QuickFile], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..files.len()).collect();
+    }
+    let mut ranked = files
+        .iter()
+        .enumerate()
+        .filter_map(|(index, file)| fuzzy_score(query, &file.label).map(|score| (index, score)))
+        .collect::<Vec<_>>();
+    ranked.sort_by(|(left_index, left_score), (right_index, right_score)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| files[*left_index].label.len().cmp(&files[*right_index].label.len()))
+            .then_with(|| files[*left_index].label.cmp(&files[*right_index].label))
+    });
+    ranked.into_iter().map(|(index, _)| index).collect()
+}
+
+fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let query = query.to_lowercase();
+    let candidate = candidate.to_lowercase();
+    let mut wanted = query.chars();
+    let mut current = wanted.next()?;
+    let mut score = 0i64;
+    let mut previous_match = None;
+    let mut previous_char = None;
+    for (index, ch) in candidate.chars().enumerate() {
+        if ch == current {
+            score += 10;
+            if previous_match == Some(index.saturating_sub(1)) {
+                score += 8;
+            }
+            if index == 0
+                || previous_char.is_some_and(|before| matches!(before, '/' | '\\' | '-' | '_' | '.'))
+            {
+                score += 6;
+            }
+            previous_match = Some(index);
+            match wanted.next() {
+                Some(next) => current = next,
+                None => return Some(score - candidate.chars().count() as i64),
+            }
+        }
+        previous_char = Some(ch);
+    }
+    None
 }
 
 fn pane_focused_in(pane_list_json: &str, pane_id: &str) -> bool {
@@ -2529,5 +2779,52 @@ mod tests {
         assert_eq!(row_index_at(body, 100, 10), Some(14));
         assert_eq!(row_index_at(body, 100, 11), None, "footer row");
         assert_eq!(row_index_at(body, 6, 2), None, "past the last row");
+    }
+
+    #[test]
+    fn quick_open_matches_case_insensitive_subsequences() {
+        let files = vec![
+            QuickFile {
+                path: PathBuf::from("src/main.rs"),
+                label: "src/main.rs".into(),
+            },
+            QuickFile {
+                path: PathBuf::from("README.md"),
+                label: "README.md".into(),
+            },
+        ];
+        assert!(fuzzy_score("SMR", "src/main.rs").is_some());
+        assert!(fuzzy_score("SMR", "README.md").is_none());
+        assert_eq!(quick_matches(&files, "read"), vec![1]);
+    }
+
+    #[test]
+    fn quick_open_index_skips_git_and_respects_hidden_files() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-sidebar-quick-open-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "").unwrap();
+        std::fs::write(root.join(".secret"), "").unwrap();
+        std::fs::write(root.join(".git/config"), "").unwrap();
+        std::fs::write(root.join("target/generated.rs"), "").unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+
+        let (hidden_off, truncated) = collect_quick_files(&root, false, 20);
+        assert!(!truncated);
+        assert_eq!(
+            hidden_off.iter().map(|file| file.label.as_str()).collect::<Vec<_>>(),
+            vec!["src/main.rs"]
+        );
+        let (hidden_on, _) = collect_quick_files(&root, true, 20);
+        assert_eq!(
+            hidden_on.iter().map(|file| file.label.as_str()).collect::<Vec<_>>(),
+            vec![".gitignore", ".secret", "src/main.rs"]
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
