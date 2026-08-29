@@ -12,6 +12,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, List, ListItem, Paragraph};
+use unicode_width::UnicodeWidthChar;
 
 use herdr_sidebar::actions::{self, MenuAction, MenuEntry};
 use herdr_sidebar::git::Git;
@@ -1217,6 +1218,9 @@ impl App {
                 if index.root != self.tree.root_path()
                     || index.show_hidden != self.tree.show_hidden
                 {
+                    if let Some(Overlay::QuickOpen { loading, .. }) = self.overlay.as_mut() {
+                        *loading = false;
+                    }
                     return;
                 }
                 if let Some(Overlay::QuickOpen {
@@ -2481,7 +2485,7 @@ fn quick_matches(files: &[QuickFile], query: &str) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(index, file)| {
-            fuzzy_score(&query_lower, &file.label_lower).map(|score| (index, score))
+            fuzzy_score_lowercased(&query_lower, &file.label_lower).map(|score| (index, score))
         })
         .collect::<Vec<_>>();
     ranked.sort_by(|(left_index, left_score), (right_index, right_score)| {
@@ -2493,7 +2497,7 @@ fn quick_matches(files: &[QuickFile], query: &str) -> Vec<usize> {
     ranked.into_iter().map(|(index, _)| index).collect()
 }
 
-fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
+fn fuzzy_score_lowercased(query: &str, candidate: &str) -> Option<i64> {
     if query.is_empty() {
         return Some(0);
     }
@@ -2525,22 +2529,24 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
 }
 
 fn truncate_path_tail(label: &str, max: usize) -> String {
-    let width = label.chars().count();
+    let width = Span::raw(label).width();
     if width <= max {
         return label.to_string();
     }
     if max == 0 {
         return String::new();
     }
-    let keep = max.saturating_sub(1);
-    let tail = label
-        .chars()
-        .rev()
-        .take(keep)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
+    let mut used = 1;
+    let mut reversed = Vec::new();
+    for ch in label.chars().rev() {
+        let char_width = ch.width().unwrap_or(0);
+        if used + char_width > max {
+            break;
+        }
+        used += char_width;
+        reversed.push(ch);
+    }
+    let tail = reversed.into_iter().rev().collect::<String>();
     format!("…{tail}")
 }
 
@@ -2909,8 +2915,8 @@ mod tests {
                 label_lower: "readme.md".into(),
             },
         ];
-        assert!(fuzzy_score("smr", "src/main.rs").is_some());
-        assert!(fuzzy_score("smr", "readme.md").is_none());
+        assert!(fuzzy_score_lowercased("smr", "src/main.rs").is_some());
+        assert!(fuzzy_score_lowercased("smr", "readme.md").is_none());
         assert_eq!(quick_matches(&files, "read"), vec![1]);
     }
 
@@ -2922,6 +2928,7 @@ mod tests {
         );
         assert_eq!(truncate_path_tail("main.rs", 12), "main.rs");
         assert_eq!(truncate_path_tail("main.rs", 0), "");
+        assert_eq!(truncate_path_tail("src/界面.rs", 8), "…界面.rs");
     }
 
     #[test]
