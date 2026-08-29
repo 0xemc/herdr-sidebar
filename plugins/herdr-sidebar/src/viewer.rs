@@ -27,6 +27,7 @@ use crate::ansi;
 use crate::editor::{EditAction, Editor, SaveOutcome};
 use crate::icons::{IconTheme, icon};
 use crate::ipc;
+use crate::ui::{icon_style as ui_icon_style, palette};
 
 /// Metadata source/token that marks the viewer pane, so the sidebar can find
 /// and reuse it (distinct from the sidebar's own identity tokens).
@@ -479,7 +480,7 @@ fn selected_row(
                 after_start && before_end
             });
             let style = if selected {
-                span.style.bg(Color::DarkGray)
+                span.style.bg(palette().text_selection_bg)
             } else {
                 span.style
             };
@@ -1354,6 +1355,11 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 current.as_ref().map(Request::doc_key).as_deref(),
                 control,
             );
+            // Settings live in a shared file another pane may rewrite; the
+            // heartbeat is the sidebar's own re-read cadence. Chrome, diff
+            // tints and selection follow immediately — an already-highlighted
+            // file keeps its syntax colors until it is reloaded.
+            crate::ui::set_color_theme(crate::state::load_state().color_theme);
             last_heartbeat = Instant::now();
         }
         if prompt.is_none() {
@@ -1451,12 +1457,9 @@ fn draw_doc(
     );
 
     let file_icon = icon(theme, &doc.name, false, false);
-    let icon_style = match file_icon.rgb {
-        Some((r, g, b)) => Style::default().fg(Color::Rgb(r, g, b)),
-        None => Style::default(),
-    };
+    let icon_style = ui_icon_style(file_icon.rgb);
     let left = vec![
-        Span::styled(" ✕ ", Style::default().bold().fg(Color::LightBlue)),
+        Span::styled(" ✕ ", Style::default().bold().fg(palette().header_accent)),
         Span::styled(format!("{} ", file_icon.glyph), icon_style),
         Span::styled(doc.name.clone(), Style::default().bold()),
     ];
@@ -1527,10 +1530,7 @@ fn draw_editor(
     .areas(area);
     let name = editor.name();
     let file_icon = icon(theme, &name, false, false);
-    let icon_style = match file_icon.rgb {
-        Some((r, g, b)) => Style::default().fg(Color::Rgb(r, g, b)),
-        None => Style::default(),
-    };
+    let icon_style = ui_icon_style(file_icon.rgb);
     let dirty = if editor.dirty { " ●" } else { "" };
     let external = if editor.external_changed {
         "  EXTERNAL CHANGE"
@@ -1538,10 +1538,10 @@ fn draw_editor(
         ""
     };
     let left = vec![
-        Span::styled(" ✕ ", Style::default().bold().fg(Color::LightBlue)),
+        Span::styled(" ✕ ", Style::default().bold().fg(palette().header_accent)),
         Span::styled(format!("{} ", file_icon.glyph), icon_style),
         Span::styled(format!("{name}{dirty}"), Style::default().bold()),
-        Span::styled("  EDIT (experimental)", Style::default().fg(Color::Yellow)),
+        Span::styled("  EDIT (experimental)", Style::default().fg(palette().warning)),
         Span::styled(external, Style::default().fg(Color::LightRed).bold()),
     ];
     let used: usize = left.iter().map(Span::width).sum();

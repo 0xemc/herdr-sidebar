@@ -22,8 +22,8 @@ use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::tree::{Row, Tree};
 use herdr_sidebar::ui::{
     TitleAction, activity_icons, draw_scrollbar, gear_icon, hits, hits_collapse_button, input_tail,
-    hover_style, keep_visible_scroll, palette, selection_style, set_color_theme,
-    sibling_panes_of, status_color, title_action_spans, title_actions_visible,
+    hover_style, icon_style as ui_icon_style, keep_visible_scroll, palette, selection_style,
+    set_color_theme, sibling_panes_of, status_color, title_action_spans, title_actions_visible,
     title_actions_width, truncate_to, wrap_footer_message, wrap_hints,
 };
 
@@ -1272,7 +1272,7 @@ impl App {
             Setting::IconTheme => self.set_theme(self.theme.toggled()),
             Setting::ColorTheme => {
                 self.sidebar_state = sidebar::update_state(|state| {
-                    state.color_theme = state.color_theme.other();
+                    state.color_theme = state.color_theme.next();
                 });
                 set_color_theme(self.sidebar_state.color_theme);
             }
@@ -2261,10 +2261,7 @@ fn row_line(row: &Row, theme: IconTheme, deco: Option<char>, width: u16) -> Line
         "  "
     };
     let icon = icon(theme, &row.name, row.is_dir, row.expanded);
-    let icon_style = match icon.rgb {
-        Some((r, g, b)) => Style::default().fg(Color::Rgb(r, g, b)),
-        None => Style::default(),
-    };
+    let icon_style = ui_icon_style(icon.rgb);
     // Folder and file names share the default foreground, like VS Code — the
     // chevron and icon carry the distinction. Accent-on-gray (the old blue
     // names) was hard to read against the selection/hover backgrounds. A git

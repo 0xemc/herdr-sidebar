@@ -252,6 +252,42 @@ reverse-video: reverse also swaps per-span git decoration colors and turns a gre
 a green background block. Keep every shared accent in `ui::Palette` so Explorer and Source Control
 cannot drift.
 
+Light terminal backgrounds (`color_theme = light`, the third value the ⚙ Settings row cycles
+through — `ColorTheme::next()` is a rotation, not a toggle):
+
+- `vscode` is VS Code's DARK palette, so on a white terminal the selection/hover/activity-bar
+  chip read as dark blocks and the wheat `modified` accent washes out. `light` is the same
+  vocabulary drawn for white (VS Code Light+ decorations, GitHub-light diff tints).
+- The dark palettes let the terminal's own foreground show through a selected row; a light
+  background needs an explicit one, hence `selection_fg`/`selection_unfocused_fg`/`hover_fg`
+  in `Palette` (`Color::Reset` = "leave it alone", which is what the dark themes store).
+- **Anything drawn outside `ui::Palette` breaks a light theme silently.** The offenders found
+  and folded back in: `diffview`'s six tint consts, the preview/editor mouse-selection
+  `DarkGray`, `Color::Yellow` advisories, and `LightBlue` glyphs. Add new colors to `Palette`,
+  never as a module const.
+- `syntect`'s themes are foregrounds only, so a dark grammar theme on white is exactly the
+  washed-out case: `syntax::assets()` loads base16-ocean.dark AND InspiredGitHub and
+  `syntaxes_and_theme()` picks per `ui::is_light()`. An already-highlighted preview keeps its
+  colors until it reloads; diffs re-render on their own ~2s refresh.
+- **A named color is the terminal profile's color, so it is not safe on a filled button**:
+  `accent_fg: Color::White` emits ANSI 15, which a light profile draws as a pale grey — ✓ Commit
+  and the Changes count badge read grey-on-blue (user-reported). Filled buttons now take
+  `button_bg`/`button_focus_bg`/`button_fg`, stated in RGB: the dark themes keep the solid accent
+  fill, and the light theme uses a soft tint (`#d8eafc`, focus `#b6d8f8`) with `#0a4a86` text,
+  because a saturated blue block dominates a white pane (user-rejected). `accent` stays what it
+  always was — the focused message-box BORDER — and must not be repurposed as a fill. Sync Changes
+  sits on `sync_bg`, not on a button fill, so it has its own `sync_fg`; it used to borrow the
+  button's white, i.e. white on a light grey button.
+- Icon colors (`icons::material`) stay ONE table; `ui::icon_style` caps their relative
+  luminance for light backgrounds instead of a second table that would drift.
+- **The `--preview` viewer is its own process and used to skip `set_color_theme` entirely**
+  (main.rs returns before the sidebar's own call) — every preview pane ran the default palette
+  whatever the user picked. main.rs now sets it before `viewer::run`, and the viewer re-reads
+  it on its 5s heartbeat like the sidebar apps do for other shared settings.
+- Verifying colors headlessly: `pane read <id> --format ansi` prints the real SGR sequences, so
+  `grep -o '4[08];2;[0-9;]*'` asserts the exact RGB a pane emitted — much stronger than the
+  text-only capture.
+
 Pane identity & titles:
 
 - `pane.report_metadata {pane_id, source, tokens:{name:value}}` attaches **metadata tokens**
