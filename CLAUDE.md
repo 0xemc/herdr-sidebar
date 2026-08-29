@@ -519,7 +519,9 @@ HACKING.md — budget time for that before promising a patched build.
   into `.git`, follows the Explorer dotfile toggle, does not follow directory symlinks, honors
   `.gitignore`/global git excludes through the bundled `ignore` walker, and uses a
   case-insensitive subsequence rank. Never require an external `rg` executable: released
-  prebuilts must behave consistently on fresh machines.
+  prebuilts must behave consistently on fresh machines. Build and cache the index on a worker
+  polled from `App::tick`: a user-selected root can be enormous, and a synchronous walk can
+  starve the heartbeat long enough for the launcher to replace a healthy pane as stale.
 - **Title-bar action buttons** (`ui.rs` `TitleAction`/`title_action_spans`): VS Code-style
   hover buttons at the header's top-right (Explorer: New File / New Folder / Refresh /
   Collapse All; SCM: Refresh / Collapse All), left of the standalone ⚙. Terminals emit NO

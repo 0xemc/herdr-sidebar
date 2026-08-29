@@ -178,10 +178,11 @@ enum Overlay {
     },
     QuickOpen {
         query: String,
-        files: Vec<QuickFile>,
+        files: std::sync::Arc<Vec<QuickFile>>,
         matches: Vec<usize>,
         selected: usize,
         truncated: bool,
+        loading: bool,
     },
 }
 
@@ -189,6 +190,14 @@ enum Overlay {
 struct QuickFile {
     path: PathBuf,
     label: String,
+    label_lower: String,
+}
+
+struct QuickIndex {
+    root: PathBuf,
+    show_hidden: bool,
+    files: std::sync::Arc<Vec<QuickFile>>,
+    truncated: bool,
 }
 
 /// One row of the Settings modal.
@@ -279,6 +288,8 @@ pub struct App {
     /// One background decoration refresh. Keeping at most one receiver avoids
     /// multiplying git processes when a slow repository overlaps the timer.
     deco_rx: Option<std::sync::mpsc::Receiver<Decorations>>,
+    quick_index: Option<QuickIndex>,
+    quick_index_rx: Option<std::sync::mpsc::Receiver<QuickIndex>>,
 }
 
 /// How long two clicks on the same row still count as a double click.
@@ -370,6 +381,8 @@ impl App {
             // Overwritten when the first background refresh is queued below.
             last_deco: std::time::Instant::now(),
             deco_rx: None,
+            quick_index: None,
+            quick_index_rx: None,
         };
         app.apply_identity();
         app.request_decorations(true);
@@ -385,6 +398,7 @@ impl App {
     /// on their own. Self-throttling, so the event loop may call it freely.
     pub fn tick(&mut self) {
         self.sync_shared_settings();
+        self.collect_quick_index();
         self.collect_decorations();
         if self.last_deco.elapsed() < DECO_REFRESH {
             return;
@@ -743,6 +757,7 @@ impl App {
             }
             KeyCode::Char('.') => {
                 self.tree.show_hidden = !self.tree.show_hidden;
+                self.invalidate_quick_index();
                 self.rebuild();
             }
             KeyCode::Char('i') => self.set_theme(self.theme.toggled()),
@@ -1191,12 +1206,79 @@ impl App {
         });
     }
 
+    fn collect_quick_index(&mut self) {
+        let result = self
+            .quick_index_rx
+            .as_ref()
+            .map(std::sync::mpsc::Receiver::try_recv);
+        match result {
+            Some(Ok(index)) => {
+                self.quick_index_rx = None;
+                if index.root != self.tree.root_path()
+                    || index.show_hidden != self.tree.show_hidden
+                {
+                    return;
+                }
+                if let Some(Overlay::QuickOpen {
+                    query,
+                    files,
+                    matches,
+                    selected,
+                    truncated,
+                    loading,
+                }) = self.overlay.as_mut()
+                {
+                    *files = std::sync::Arc::clone(&index.files);
+                    *matches = quick_matches(files, query);
+                    *selected = 0;
+                    *truncated = index.truncated;
+                    *loading = false;
+                }
+                self.quick_index = Some(index);
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.quick_index_rx = None;
+                if let Some(Overlay::QuickOpen { loading, .. }) = self.overlay.as_mut() {
+                    *loading = false;
+                }
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    fn invalidate_quick_index(&mut self) {
+        self.quick_index = None;
+        self.quick_index_rx = None;
+    }
+
     fn open_quick_open(&mut self) {
-        let (files, truncated) = collect_quick_files(
-            &self.tree.root_path(),
-            self.tree.show_hidden,
-            QUICK_OPEN_FILE_LIMIT,
-        );
+        let root = self.tree.root_path();
+        let show_hidden = self.tree.show_hidden;
+        let cached = self
+            .quick_index
+            .as_ref()
+            .filter(|index| index.root == root && index.show_hidden == show_hidden)
+            .map(|index| (std::sync::Arc::clone(&index.files), index.truncated));
+        let (files, truncated, loading) = if let Some((files, truncated)) = cached {
+            (files, truncated, false)
+        } else {
+            if self.quick_index_rx.is_none() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let worker_root = root.clone();
+                std::thread::spawn(move || {
+                    let (files, truncated) =
+                        collect_quick_files(&worker_root, show_hidden, QUICK_OPEN_FILE_LIMIT);
+                    let _ = tx.send(QuickIndex {
+                        root: worker_root,
+                        show_hidden,
+                        files: std::sync::Arc::new(files),
+                        truncated,
+                    });
+                });
+                self.quick_index_rx = Some(rx);
+            }
+            (std::sync::Arc::new(Vec::new()), false, true)
+        };
         let matches = quick_matches(&files, "");
         self.overlay = Some(Overlay::QuickOpen {
             query: String::new(),
@@ -1204,6 +1286,7 @@ impl App {
             matches,
             selected: 0,
             truncated,
+            loading,
         });
     }
 
@@ -1358,6 +1441,7 @@ impl App {
             }
             Setting::HiddenFiles => {
                 self.tree.show_hidden = !self.tree.show_hidden;
+                self.invalidate_quick_index();
                 self.rebuild();
             }
             Setting::Hotkeys => {
@@ -1723,6 +1807,7 @@ impl App {
 
     fn refresh_tree(&mut self) {
         self.tree.refresh();
+        self.invalidate_quick_index();
         self.rediscover_repos();
         self.request_decorations(true);
         self.rebuild();
@@ -2268,6 +2353,7 @@ impl App {
             matches,
             selected,
             truncated,
+            loading,
         }) = self.overlay.as_ref()
         else {
             return;
@@ -2300,8 +2386,8 @@ impl App {
             .take(usize::from(list_area.height))
             .filter_map(|(match_index, file_index)| {
                 let file = files.get(*file_index)?;
-                let label = truncate_to(
-                    file.label.clone(),
+                let label = truncate_path_tail(
+                    &file.label,
                     usize::from(list_area.width).saturating_sub(1),
                 );
                 let line = Line::raw(format!(" {label}"));
@@ -2312,7 +2398,9 @@ impl App {
                 })
             })
             .collect::<Vec<_>>();
-        let status = if matches.is_empty() {
+        let status = if *loading {
+            "indexing files…".to_string()
+        } else if matches.is_empty() {
             "no matching files".to_string()
         } else if *truncated {
             format!(
@@ -2369,13 +2457,18 @@ fn collect_quick_files(root: &Path, show_hidden: bool, limit: usize) -> (Vec<Qui
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        files.push(QuickFile { path, label });
+        let label_lower = label.to_lowercase();
+        files.push(QuickFile {
+            path,
+            label,
+            label_lower,
+        });
         if files.len() >= limit {
             truncated = true;
             break;
         }
     }
-    files.sort_by_key(|file| file.label.to_lowercase());
+    files.sort_by(|left, right| left.label_lower.cmp(&right.label_lower));
     (files, truncated)
 }
 
@@ -2383,10 +2476,13 @@ fn quick_matches(files: &[QuickFile], query: &str) -> Vec<usize> {
     if query.is_empty() {
         return (0..files.len()).collect();
     }
+    let query_lower = query.to_lowercase();
     let mut ranked = files
         .iter()
         .enumerate()
-        .filter_map(|(index, file)| fuzzy_score(query, &file.label).map(|score| (index, score)))
+        .filter_map(|(index, file)| {
+            fuzzy_score(&query_lower, &file.label_lower).map(|score| (index, score))
+        })
         .collect::<Vec<_>>();
     ranked.sort_by(|(left_index, left_score), (right_index, right_score)| {
         right_score
@@ -2401,8 +2497,6 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
     if query.is_empty() {
         return Some(0);
     }
-    let query = query.to_lowercase();
-    let candidate = candidate.to_lowercase();
     let mut wanted = query.chars();
     let mut current = wanted.next()?;
     let mut score = 0i64;
@@ -2428,6 +2522,26 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
         previous_char = Some(ch);
     }
     None
+}
+
+fn truncate_path_tail(label: &str, max: usize) -> String {
+    let width = label.chars().count();
+    if width <= max {
+        return label.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let keep = max.saturating_sub(1);
+    let tail = label
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("…{tail}")
 }
 
 fn pane_focused_in(pane_list_json: &str, pane_id: &str) -> bool {
@@ -2787,15 +2901,27 @@ mod tests {
             QuickFile {
                 path: PathBuf::from("src/main.rs"),
                 label: "src/main.rs".into(),
+                label_lower: "src/main.rs".into(),
             },
             QuickFile {
                 path: PathBuf::from("README.md"),
                 label: "README.md".into(),
+                label_lower: "readme.md".into(),
             },
         ];
-        assert!(fuzzy_score("SMR", "src/main.rs").is_some());
-        assert!(fuzzy_score("SMR", "README.md").is_none());
+        assert!(fuzzy_score("smr", "src/main.rs").is_some());
+        assert!(fuzzy_score("smr", "readme.md").is_none());
         assert_eq!(quick_matches(&files, "read"), vec![1]);
+    }
+
+    #[test]
+    fn quick_open_truncation_keeps_the_filename_visible() {
+        assert_eq!(
+            truncate_path_tail("src/very/deep/nested/thing.rs", 12),
+            "…ed/thing.rs"
+        );
+        assert_eq!(truncate_path_tail("main.rs", 12), "main.rs");
+        assert_eq!(truncate_path_tail("main.rs", 0), "");
     }
 
     #[test]
