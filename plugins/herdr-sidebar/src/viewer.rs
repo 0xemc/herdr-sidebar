@@ -18,7 +18,9 @@ use crossterm::event::{
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
+#[cfg(test)]
+use ratatui::style::Color;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthChar;
@@ -1542,7 +1544,7 @@ fn draw_editor(
         Span::styled(format!("{} ", file_icon.glyph), icon_style),
         Span::styled(format!("{name}{dirty}"), Style::default().bold()),
         Span::styled("  EDIT (experimental)", Style::default().fg(palette().warning)),
-        Span::styled(external, Style::default().fg(Color::LightRed).bold()),
+        Span::styled(external, Style::default().fg(palette().conflict).bold()),
     ];
     let used: usize = left.iter().map(Span::width).sum();
     let context = editor.context();
