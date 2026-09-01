@@ -320,7 +320,8 @@ Terminal fonts for icon glyphs (Windows, verified live):
 - **A TUI cannot detect whether the terminal font renders a glyph** — missing glyphs
   (tofu) still occupy their cells, so cursor-position probing sees nothing. The icon
   theme therefore resolves env → persisted `icons` in state.json → a "Nerd Font
-  installed?" probe (Windows font registries via `reg query` / `fc-list` elsewhere),
+  installed?" probe (Windows font registries via `reg query`; macOS's standard
+  font directories; Linux `fc-list`),
   and any manual toggle persists (`set_theme`) so a wrong guess is corrected exactly
   once. Installed ≠ selected in the terminal profile: switching WT color schemes via
   the settings UI can silently DROP profiles.defaults.font, reverting the terminal to
@@ -644,6 +645,11 @@ setting are all gone.
   to it instead of opening a second one. Both gestures work in the Explorer AND the
   Source Control view (staged/unstaged diffs, and git-graph refs — commits, stashes,
   branches, tags).
+- `Preview opens in: pane` is an explicit opt-in that instead keeps one inline viewer
+  in the sidebar's own tab and reuses it per caller tab. `tab` remains the default.
+  Inline placement never parks or moves the user's panes to another tab, never claims
+  `hs-preview-dedicated`, and `q`/Esc closes only the viewer pane. Placement is stamped
+  on the viewer with `hs-preview-inline`; do not infer it later from mutable settings.
 - Why the inversion: full-size mode evacuated the CURRENT tab (parking the user's
   terminals into a background "· preview" tab), and the park plan was keyed by the
   SIDEBAR's pane id — which churns on every redeploy and every ensure-hook heal. The
@@ -704,16 +710,22 @@ setting are all gone.
   deliberately not a
   live sync; the SCM side saves on user-action paths to avoid timer write-churn. Paths
   outside the tree's root are dropped on load, since one file serves every workspace.
-- Sidebar roots are remembered per space by **workspace LABEL, not id** — ids identify
-  a space INSTANCE, not a project (a space moved from `wG` to `wH` within one
-  session), so an id-keyed root lands under an unrelated space. Every successful manual or
+- Sidebar roots are remembered per **workspace label + normalized spawn cwd**. A workspace
+  can hold unrelated project tabs, so label-only keys race and leak roots across those tabs;
+  tab ids change across server restarts and would grow `roots.json` forever. The project-path
+  key also preserves an explicit manual root across restarts. v0.10 label-only entries migrate
+  only when the remembered path contains the tab's spawn cwd. Every successful manual or
   followed re-root is written to `roots.json`; a read-only `load_root` API is dead behavior.
 - The ensure hook roots a docked sidebar from **the event's own tab**
   (`--event-scope` → `launch_decision_in` / `focused_pane_in`): during a workspace
   switch the globally focused pane is still the space you came from. The Windows
   ensure SIDECAR (`src/ensure.rs`) carries the same scoping — PR #15 scoped only the
   unix `ensure-sidebar.sh`, so without this Windows kept the old cross-space bug.
-  Toggles stay unscoped (a deliberate act on the focused tab).
+  `pane.focused` has no `tab_id`, so resolve its `pane_id` through the same `pane.list`
+  snapshot; a workspace scope with several tabs is ambiguous and must not pick one.
+  Spawn roots prefer `foreground_cwd` but fall back to `cwd` because Windows herdr 0.8 does
+  not currently emit the live field; continuous following still requires `foreground_cwd`
+  and never resurrects stale `cwd`. Toggles stay unscoped (a deliberate act on the focused tab).
 
 ### Diff preview
 

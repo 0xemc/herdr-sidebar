@@ -765,25 +765,25 @@ fn decode_roots_file(json: &str) -> RootsFile {
         .unwrap_or_default()
 }
 
-/// The root remembered for `label`, if any. An empty label never matches —
-/// it would collide across every space that failed to report one.
-fn root_for_label(file: &RootsFile, label: &str) -> Option<PathBuf> {
-    if label.is_empty() {
+/// The root remembered for `key`, if any. An empty key never matches — it
+/// would collide across every pane that failed to report its project identity.
+fn root_for_key(file: &RootsFile, key: &str) -> Option<PathBuf> {
+    if key.is_empty() {
         return None;
     }
-    file.get(label).and_then(|v| v.as_str()).map(PathBuf::from)
+    file.get(key).and_then(|v| v.as_str()).map(PathBuf::from)
 }
 
-/// The root this space's tree should use, or `None` to fall back to the
+/// The root this project's tree should use, or `None` to fall back to the
 /// pane's cwd.
-pub fn load_root(label: &str) -> Option<PathBuf> {
+pub fn load_root(key: &str) -> Option<PathBuf> {
     let json = roots_path().and_then(|p| std::fs::read_to_string(p).ok())?;
-    root_for_label(&decode_roots_file(&json), label)
+    root_for_key(&decode_roots_file(&json), key)
 }
 
-/// Remember `root` for `label`, leaving other spaces' choices alone.
-pub fn save_root(label: &str, root: &Path) {
-    if label.is_empty() {
+/// Remember `root` for `key`, leaving other projects' choices alone.
+pub fn save_root(key: &str, root: &Path) {
+    if key.is_empty() {
         return;
     }
     let Some(path) = roots_path() else { return };
@@ -797,7 +797,7 @@ pub fn save_root(label: &str, root: &Path) {
         .map(|json| decode_roots_file(&json))
         .unwrap_or_default();
     file.insert(
-        label.to_string(),
+        key.to_string(),
         serde_json::json!(root.display().to_string()),
     );
     if let Ok(json) = serde_json::to_string(&file) {
@@ -882,32 +882,33 @@ pub fn parse_state(json: &str) -> State {
 mod tests {
     use super::*;
 
-    /// Workspace IDs are per-space-INSTANCE, not per-project: closing and
-    /// recreating `tremor` moved it from `wG` to `wH` inside one session.
-    /// Keying a remembered root on the id would hand a future space the root
-    /// picked for an unrelated one, so the label is the key.
+    /// A workspace can hold several unrelated project tabs. The caller
+    /// combines its workspace label and normalized spawn cwd so a volatile tab
+    /// id cannot leak state or grow the file on every server restart.
     #[test]
-    fn remembered_roots_are_keyed_by_workspace_label() {
-        let file = decode_roots_file(r#"{"tremor":"/repo/tremor","faultline":"/repo/faultline"}"#);
-        assert_eq!(
-            root_for_label(&file, "tremor"),
-            Some(PathBuf::from("/repo/tremor"))
+    fn remembered_roots_are_keyed_by_workspace_and_project() {
+        let file = decode_roots_file(
+            r#"{"acme::/repo/web":"/repo/web","acme::/repo/admin":"/repo/admin"}"#,
         );
         assert_eq!(
-            root_for_label(&file, "faultline"),
-            Some(PathBuf::from("/repo/faultline"))
+            root_for_key(&file, "acme::/repo/web"),
+            Some(PathBuf::from("/repo/web"))
+        );
+        assert_eq!(
+            root_for_key(&file, "acme::/repo/admin"),
+            Some(PathBuf::from("/repo/admin"))
         );
         // An unknown space has made no choice yet — the caller falls back to cwd.
-        assert_eq!(root_for_label(&file, "bedrock"), None);
+        assert_eq!(root_for_key(&file, "acme::/repo/jobs"), None);
         // An empty label must never match; it would collide across spaces.
-        assert_eq!(root_for_label(&file, ""), None);
+        assert_eq!(root_for_key(&file, ""), None);
     }
 
     #[test]
     fn a_garbled_roots_file_forgets_rather_than_wedges() {
         for junk in ["garbage", "[]", r#"{"tremor":42}"#, ""] {
             assert_eq!(
-                root_for_label(&decode_roots_file(junk), "tremor"),
+                root_for_key(&decode_roots_file(junk), "acme::/repo/web"),
                 None,
                 "{junk}"
             );
