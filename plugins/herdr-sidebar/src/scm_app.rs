@@ -408,6 +408,7 @@ enum Setting {
     SidebarWidth,
     IconTheme,
     ColorTheme,
+    PreviewPlacement,
     AutoOpen,
     StrictToggle,
     FocusOnOpen,
@@ -1788,6 +1789,12 @@ impl App {
                 true,
             ),
             (
+                Setting::PreviewPlacement,
+                "Preview opens in",
+                self.sidebar_state.preview_placement.label().to_string(),
+                true,
+            ),
+            (
                 Setting::Hotkeys,
                 "Footer hotkeys",
                 if self.show_hotkeys() {
@@ -1885,6 +1892,11 @@ impl App {
                     state.color_theme = state.color_theme.next();
                 });
                 set_color_theme(self.sidebar_state.color_theme);
+            }
+            Setting::PreviewPlacement => {
+                self.sidebar_state = sidebar::update_state(|state| {
+                    state.preview_placement = state.preview_placement.other();
+                });
             }
             Setting::Hotkeys => {
                 self.sidebar_state =

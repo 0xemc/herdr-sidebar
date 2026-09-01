@@ -47,6 +47,12 @@ pub const EXECUTABLE_NAME: &str = "herdr-sidebar";
 /// has different quoting/call syntax.
 pub const PREVIEW_CONTROL_ENV: &str = "HERDR_SIDEBAR_PREVIEW_CONTROL";
 
+/// Set on viewer panes spawned into the sidebar's own tab
+/// ([`PreviewPlacement::Pane`]). A viewer's placement is fixed by where its
+/// pane physically sits, so it travels with the process rather than being
+/// re-read from the settings file, which the user can flip mid-life.
+pub const PREVIEW_INLINE_ENV: &str = "HERDR_SIDEBAR_PREVIEW_INLINE";
+
 /// Unix seconds now — the heartbeat clock for pane identity tokens.
 pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -179,6 +185,45 @@ impl ColorTheme {
     }
 }
 
+/// Where a preview, diff or `git show` opens. `Tab` gives every document its
+/// own herdr tab (VS Code editor-tab semantics, the historical default);
+/// `Pane` splits ONE viewer pane into the tab the sidebar already lives in
+/// and reuses it for every later click.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PreviewPlacement {
+    Tab,
+    Pane,
+}
+
+impl PreviewPlacement {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tab => "tab",
+            Self::Pane => "pane",
+        }
+    }
+
+    pub fn other(self) -> Self {
+        match self {
+            Self::Tab => Self::Pane,
+            Self::Pane => Self::Tab,
+        }
+    }
+
+    /// True when previews share the caller's tab instead of getting one.
+    pub fn is_inline(self) -> bool {
+        matches!(self, Self::Pane)
+    }
+
+    fn from_state_name(name: &str) -> Option<Self> {
+        match name {
+            "tab" => Some(Self::Tab),
+            "pane" => Some(Self::Pane),
+            _ => None,
+        }
+    }
+}
+
 /// The sticky sidebar setting, shared by both plugins.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct State {
@@ -223,6 +268,9 @@ pub struct State {
     /// column target in the normal range and yields proportionally when the
     /// tab becomes unusually narrow.
     pub sidebar_width: u16,
+    /// Whether a clicked file opens in its own tab or in a viewer pane beside
+    /// the sidebar, inside the tab the click came from.
+    pub preview_placement: PreviewPlacement,
 }
 
 impl Default for State {
@@ -241,6 +289,7 @@ impl Default for State {
             git_deco: true,
             dock_right: false,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            preview_placement: PreviewPlacement::Tab,
         }
     }
 }
@@ -377,7 +426,7 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\"{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\"{icons}}}",
         state.merged,
         state.active.state_name(),
         state.show_hotkeys,
@@ -389,7 +438,8 @@ fn write_state(path: &Path, state: State) {
         state.git_deco,
         state.dock_right,
         clamp_sidebar_width(state.sidebar_width),
-        state.color_theme.label()
+        state.color_theme.label(),
+        state.preview_placement.label()
     );
     let _ = std::fs::write(path, json);
 }
@@ -820,6 +870,11 @@ pub fn parse_state(json: &str) -> State {
             .and_then(|v| u16::try_from(v).ok())
             .map(clamp_sidebar_width)
             .unwrap_or(default.sidebar_width),
+        preview_placement: value
+            .get("preview_placement")
+            .and_then(|v| v.as_str())
+            .and_then(PreviewPlacement::from_state_name)
+            .unwrap_or(default.preview_placement),
     }
 }
 
@@ -958,8 +1013,9 @@ mod tests {
             git_deco: false,
             dock_right: true,
             sidebar_width: 44,
+            preview_placement: PreviewPlacement::Pane,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git
@@ -999,6 +1055,21 @@ mod tests {
         assert_eq!(parse_state("{\"merged\":true}").sidebar_width, 32);
         assert_eq!(parse_state("{\"sidebar_width\":1}").sidebar_width, 24);
         assert_eq!(parse_state("{\"sidebar_width\":999}").sidebar_width, 80);
+        // Files written before the preview setting existed keep the
+        // historical behavior: a tab per document.
+        assert_eq!(
+            parse_state("{\"merged\":true}").preview_placement,
+            PreviewPlacement::Tab
+        );
+        // Undocumented placement names fall back to the stable tab default.
+        assert_eq!(
+            parse_state("{\"preview_placement\":\"split\"}").preview_placement,
+            PreviewPlacement::Tab
+        );
+        assert_eq!(
+            parse_state("{\"preview_placement\":\"nonsense\"}").preview_placement,
+            PreviewPlacement::Tab
+        );
         assert_eq!(parse_state("garbage"), State::default());
         assert_eq!(parse_state("{\"active\":\"bogus\"}"), State::default());
     }
