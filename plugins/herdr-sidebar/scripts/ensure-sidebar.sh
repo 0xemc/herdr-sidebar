@@ -55,7 +55,7 @@ panes="$("$herdr_bin" pane list 2>/dev/null || true)"
 # you came from during a workspace switch, which rooted new sidebars in the
 # wrong project. Everything below reasons about this one scope — decision,
 # snooze check, and spawn cwd must agree or we dock into the wrong tab.
-scope="$("$bin" --event-scope 2>/dev/null || true)"
+scope="$(printf '%s' "$panes" | "$bin" --event-scope 2>/dev/null || true)"
 
 decision="$(printf '%s' "$panes" | "$bin" --launch-decision "" "$scope" 2>/dev/null || true)"
 replacing="false"

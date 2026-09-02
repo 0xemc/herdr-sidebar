@@ -74,7 +74,7 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
     let scope = if toggle {
         String::new()
     } else {
-        launch::event_scope(&event_json)
+        launch::event_scope_in(&event_json, &panes)
     };
     let tab = snooze_tab_for_scope(&panes, &scope);
     let snooze_dir = snooze::dir();

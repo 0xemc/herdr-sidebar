@@ -252,6 +252,42 @@ reverse-video: reverse also swaps per-span git decoration colors and turns a gre
 a green background block. Keep every shared accent in `ui::Palette` so Explorer and Source Control
 cannot drift.
 
+Light terminal backgrounds (`color_theme = light`, the third value the ⚙ Settings row cycles
+through — `ColorTheme::next()` is a rotation, not a toggle):
+
+- `vscode` is VS Code's DARK palette, so on a white terminal the selection/hover/activity-bar
+  chip read as dark blocks and the wheat `modified` accent washes out. `light` is the same
+  vocabulary drawn for white (VS Code Light+ decorations, GitHub-light diff tints).
+- The dark palettes let the terminal's own foreground show through a selected row; a light
+  background needs an explicit one, hence `selection_fg`/`selection_unfocused_fg`/`hover_fg`
+  in `Palette` (`Color::Reset` = "leave it alone", which is what the dark themes store).
+- **Anything drawn outside `ui::Palette` breaks a light theme silently.** The offenders found
+  and folded back in: `diffview`'s six tint consts, the preview/editor mouse-selection
+  `DarkGray`, `Color::Yellow` advisories, and `LightBlue` glyphs. Add new colors to `Palette`,
+  never as a module const.
+- `syntect`'s themes are foregrounds only, so a dark grammar theme on white is exactly the
+  washed-out case: `syntax::assets()` loads base16-ocean.dark AND InspiredGitHub and
+  `syntaxes_and_theme()` picks per `ui::is_light()`. An already-highlighted preview keeps its
+  colors until it reloads; diffs re-render on their own ~2s refresh.
+- **A named color is the terminal profile's color, so it is not safe on a filled button**:
+  `accent_fg: Color::White` emits ANSI 15, which a light profile draws as a pale grey — ✓ Commit
+  and the Changes count badge read grey-on-blue (user-reported). Filled buttons now take
+  `button_bg`/`button_focus_bg`/`button_fg`, stated in RGB: the dark themes keep the solid accent
+  fill, and the light theme uses a soft tint (`#d8eafc`, focus `#b6d8f8`) with `#0a4a86` text,
+  because a saturated blue block dominates a white pane (user-rejected). `accent` stays what it
+  always was — the focused message-box BORDER — and must not be repurposed as a fill. Sync Changes
+  sits on `sync_bg`, not on a button fill, so it has its own `sync_fg`; it used to borrow the
+  button's white, i.e. white on a light grey button.
+- Icon colors (`icons::material`) stay ONE table; `ui::icon_style` caps their relative
+  luminance for light backgrounds instead of a second table that would drift.
+- **The `--preview` viewer is its own process and used to skip `set_color_theme` entirely**
+  (main.rs returns before the sidebar's own call) — every preview pane ran the default palette
+  whatever the user picked. main.rs now sets it before `viewer::run`, and the viewer re-reads
+  it on its 5s heartbeat like the sidebar apps do for other shared settings.
+- Verifying colors headlessly: `pane read <id> --format ansi` prints the real SGR sequences, so
+  `grep -o '4[08];2;[0-9;]*'` asserts the exact RGB a pane emitted — much stronger than the
+  text-only capture.
+
 Pane identity & titles:
 
 - `pane.report_metadata {pane_id, source, tokens:{name:value}}` attaches **metadata tokens**
@@ -284,7 +320,8 @@ Terminal fonts for icon glyphs (Windows, verified live):
 - **A TUI cannot detect whether the terminal font renders a glyph** — missing glyphs
   (tofu) still occupy their cells, so cursor-position probing sees nothing. The icon
   theme therefore resolves env → persisted `icons` in state.json → a "Nerd Font
-  installed?" probe (Windows font registries via `reg query` / `fc-list` elsewhere),
+  installed?" probe (Windows font registries via `reg query`; macOS's standard
+  font directories; Linux `fc-list`),
   and any manual toggle persists (`set_theme`) so a wrong guess is corrected exactly
   once. Installed ≠ selected in the terminal profile: switching WT color schemes via
   the settings UI can silently DROP profiles.defaults.font, reverting the terminal to
@@ -478,6 +515,14 @@ HACKING.md — budget time for that before promising a patched build.
   fits a ~34-col pane.
 - Gotcha: after the ✧ suggestion lands, panel focus moves to the message box — letter keys
   then type text instead of triggering actions (Esc returns to the list).
+- Explorer Quick Open is `Ctrl+P` and reuses the normal preview client rather than inventing
+  a second open path. Its in-process filename index is capped at 20,000 files, never descends
+  into `.git`, follows the Explorer dotfile toggle, does not follow directory symlinks, honors
+  `.gitignore`/global git excludes through the bundled `ignore` walker, and uses a
+  case-insensitive subsequence rank. Never require an external `rg` executable: released
+  prebuilts must behave consistently on fresh machines. Build and cache the index on a worker
+  polled from `App::tick`: a user-selected root can be enormous, and a synchronous walk can
+  starve the heartbeat long enough for the launcher to replace a healthy pane as stale.
 - **Title-bar action buttons** (`ui.rs` `TitleAction`/`title_action_spans`): VS Code-style
   hover buttons at the header's top-right (Explorer: New File / New Folder / Refresh /
   Collapse All; SCM: Refresh / Collapse All), left of the standalone ⚙. Terminals emit NO
@@ -600,6 +645,11 @@ setting are all gone.
   to it instead of opening a second one. Both gestures work in the Explorer AND the
   Source Control view (staged/unstaged diffs, and git-graph refs — commits, stashes,
   branches, tags).
+- `Preview opens in: pane` is an explicit opt-in that instead keeps one inline viewer
+  in the sidebar's own tab and reuses it per caller tab. `tab` remains the default.
+  Inline placement never parks or moves the user's panes to another tab, never claims
+  `hs-preview-dedicated`, and `q`/Esc closes only the viewer pane. Placement is stamped
+  on the viewer with `hs-preview-inline`; do not infer it later from mutable settings.
 - Why the inversion: full-size mode evacuated the CURRENT tab (parking the user's
   terminals into a background "· preview" tab), and the park plan was keyed by the
   SIDEBAR's pane id — which churns on every redeploy and every ensure-hook heal. The
@@ -660,16 +710,22 @@ setting are all gone.
   deliberately not a
   live sync; the SCM side saves on user-action paths to avoid timer write-churn. Paths
   outside the tree's root are dropped on load, since one file serves every workspace.
-- Sidebar roots are remembered per space by **workspace LABEL, not id** — ids identify
-  a space INSTANCE, not a project (a space moved from `wG` to `wH` within one
-  session), so an id-keyed root lands under an unrelated space. Every successful manual or
+- Sidebar roots are remembered per **workspace label + normalized spawn cwd**. A workspace
+  can hold unrelated project tabs, so label-only keys race and leak roots across those tabs;
+  tab ids change across server restarts and would grow `roots.json` forever. The project-path
+  key also preserves an explicit manual root across restarts. v0.10 label-only entries migrate
+  only when the remembered path contains the tab's spawn cwd. Every successful manual or
   followed re-root is written to `roots.json`; a read-only `load_root` API is dead behavior.
 - The ensure hook roots a docked sidebar from **the event's own tab**
   (`--event-scope` → `launch_decision_in` / `focused_pane_in`): during a workspace
   switch the globally focused pane is still the space you came from. The Windows
   ensure SIDECAR (`src/ensure.rs`) carries the same scoping — PR #15 scoped only the
   unix `ensure-sidebar.sh`, so without this Windows kept the old cross-space bug.
-  Toggles stay unscoped (a deliberate act on the focused tab).
+  `pane.focused` has no `tab_id`, so resolve its `pane_id` through the same `pane.list`
+  snapshot; a workspace scope with several tabs is ambiguous and must not pick one.
+  Spawn roots prefer `foreground_cwd` but fall back to `cwd` because Windows herdr 0.8 does
+  not currently emit the live field; continuous following still requires `foreground_cwd`
+  and never resurrects stale `cwd`. Toggles stay unscoped (a deliberate act on the focused tab).
 
 ### Diff preview
 
