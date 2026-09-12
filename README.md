@@ -2,10 +2,12 @@
 
 # Herdr Sidebar
 
-### A VS Code-style sidebar for your terminal.
+### The sidebar your terminal was missing — inspired by VS Code.
 
-Explorer, project search, Source Control, and previews in one dockable
-[herdr](https://github.com/ogulcancelik/herdr) pane.
+A file explorer and a full source-control panel in one dockable
+[herdr](https://github.com/ogulcancelik/herdr) pane — activity-bar switching,
+mouse-driven controls, AI-drafted commit messages, and file previews that open as editor
+tabs — ephemeral until you double-click to pin one.
 
 <img alt="Rust" src="https://img.shields.io/badge/Rust-self--contained_crate-orange?logo=rust&logoColor=white">
 <img alt="herdr" src="https://img.shields.io/badge/herdr-%E2%89%A5%200.8-5865a3">
@@ -15,9 +17,12 @@ Explorer, project search, Source Control, and previews in one dockable
 
 <br><br>
 
-<img src="plugins/herdr-sidebar/docs/media/hero.png" alt="Herdr Sidebar beside a fleet of coding agents" width="920">
+<img src="plugins/herdr-sidebar/docs/media/hero.png" alt="The sidebar docked beside a 2x2 fleet of Claude Code and Codex agents" width="920">
 
 </div>
+
+If you've ever alt-tabbed out of your terminal just to *look* at the tree, the diff, or
+what's staged, this closes that loop.
 
 ```sh
 herdr plugin install alexarthurs/herdr-sidebar/plugins/herdr-sidebar
