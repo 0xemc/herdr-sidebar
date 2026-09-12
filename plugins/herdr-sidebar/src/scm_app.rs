@@ -16,31 +16,59 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Wrap};
 
 use herdr_sidebar::actions::{copy_to_clipboard, open_external, reveal};
+use herdr_sidebar::branch_ui::{
+    BranchPicker, FooterZones, PickerAction, draw_git_footer, sync_glyph,
+};
 use herdr_sidebar::git::{FileEntry, Git, Status};
 use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::state::Exit;
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::suggest;
 use herdr_sidebar::ui::{
-    TitleAction, activity_icons, branch_icon, draw_scrollbar, gear_icon, hits,
-    hits_collapse_button, hover_style, icon_style as ui_icon_style, keep_visible_scroll, palette,
-    selection_style, set_color_theme, sibling_panes_of, sparkle_icon, status_color,
-    title_action_spans, title_actions_visible, title_actions_width, truncate_to, within,
-    wrap_footer_message, wrap_hints,
+    TitleAction, activity_button_style, activity_icons, branch_icon, draw_activity_caps,
+    draw_scrollbar, gear_icon, hits, hits_collapse_button, hover_style,
+    icon_style as ui_icon_style, keep_visible_scroll, palette, selection_style, set_color_theme,
+    sibling_panes_of, sparkle_icon, status_color, title_action_spans, title_actions_visible,
+    title_actions_width, truncate_to, within, wrap_footer_message, wrap_hints,
 };
 
 /// How many log lines the history-ish drawers fetch.
 const DRAWER_LIMIT: usize = 30;
+const REPO_HEADER_ACTIONS: &str = " ⇅  ✓ ";
 
 /// How long two clicks on the same row still count as a double click (to pin
 /// a diff/show tab), matching the file explorer.
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(450);
+
+fn sync_is_primary(status: &Status) -> bool {
+    status.staged.is_empty()
+        && status.unstaged.is_empty()
+        && status.has_upstream
+        && status.ahead + status.behind > 0
+}
+
+fn sync_label_for_status(status: &Status, syncing: bool) -> Option<String> {
+    if syncing {
+        return Some(format!("{} Syncing…", sync_glyph(true)));
+    }
+    if !status.has_upstream || status.ahead + status.behind == 0 {
+        return None;
+    }
+    let mut counts = Vec::new();
+    if status.ahead > 0 {
+        counts.push(format!("{}↑", status.ahead));
+    }
+    if status.behind > 0 {
+        counts.push(format!("{}↓", status.behind));
+    }
+    Some(format!("⟳ Sync Changes {}", counts.join(" ")))
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Focus {
@@ -374,6 +402,7 @@ enum MenuEntry {
 
 /// A modal layered over the list; while open it owns keyboard and mouse input.
 enum Overlay {
+    BranchPicker(BranchPicker),
     Menu {
         x: u16,
         y: u16,
@@ -414,6 +443,7 @@ enum Setting {
     FocusOnOpen,
     FollowCwd,
     GitDecorations,
+    GitFooter,
     Hotkeys,
     Folder,
 }
@@ -436,6 +466,7 @@ struct BodyGeom {
 struct ClickZones {
     activity_row: u16,
     explorer: (u16, u16),
+    search: (u16, u16),
     source_control: (u16, u16),
     /// The ⚙ button (activity bar in unified mode, header otherwise).
     gear: Rect,
@@ -444,6 +475,9 @@ struct ClickZones {
     button: Rect,
     /// The Sync Changes row (zero-sized when hidden).
     sync: Rect,
+    /// Branch text in the Source Control header.
+    header_branch: Rect,
+    git_footer: FooterZones,
 }
 
 /// Handle for identity/label control of our own pane over the socket API.
@@ -564,7 +598,7 @@ pub struct App {
     /// Pending ✧ commit-message generation, polled from tick().
     suggesting: Option<Receiver<String>>,
     /// Pending Sync Changes run, polled from tick().
-    syncing: Option<Receiver<Result<String, String>>>,
+    syncing: Option<(usize, Receiver<Result<String, String>>)>,
     overlay: Option<Overlay>,
     hovered: Option<usize>,
     body: BodyGeom,
@@ -605,6 +639,7 @@ pub struct App {
     /// only clears one of these roots, so a stale sibling pane cannot erase a
     /// newer draft it never observed.
     persisted_draft_roots: std::collections::BTreeSet<String>,
+    pending_unified_width: Option<(u16, std::time::Instant)>,
 }
 
 const MY_VIEW: View = View::SourceControl;
@@ -704,6 +739,7 @@ impl App {
             picking: None,
             cwd_follower,
             persisted_draft_roots,
+            pending_unified_width: None,
         };
         app.apply_identity();
         app.refresh();
@@ -763,8 +799,20 @@ impl App {
     /// immediately re-dock a fresh one) and close our own pane. The herdr
     /// prefix+b keybinding (→ the toggle action) brings it back.
     fn hide(&mut self) {
+        self.close(true);
+    }
+
+    fn close(&mut self, snooze: bool) {
+        // A direct pane close kills the process without a Drop/signal hook.
+        // Persist drafts first; failure keeps the live pane open with the
+        // existing error notice from persist_scm().
+        if !self.persist_scm() {
+            return;
+        }
         let Some(ctl) = &self.pane_ctl else { return };
-        if let Ok(json) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) {
+        if snooze
+            && let Ok(json) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({}))
+        {
             let tab = herdr_sidebar::launch::tab_of(&json, &ctl.pane_id);
             herdr_sidebar::snooze::set(&herdr_sidebar::snooze::dir(), &tab);
         }
@@ -794,6 +842,7 @@ impl App {
 
     /// Re-stamp the identity tokens so launchers know this pane is alive.
     pub fn heartbeat(&mut self) {
+        self.poll_unified_close();
         if self.last_beat.elapsed() < std::time::Duration::from_secs(5) {
             return;
         }
@@ -802,6 +851,36 @@ impl App {
             ctl.report_tokens(MY_VIEW, self.merged());
         }
         self.follow_sibling_cwd();
+    }
+
+    fn poll_unified_close(&mut self) -> bool {
+        let Some((target, started)) = self.pending_unified_width else {
+            return false;
+        };
+        let Some(pane_id) = self.pane_ctl.as_ref().map(|ctl| ctl.pane_id.clone()) else {
+            self.pending_unified_width = None;
+            return false;
+        };
+        let Ok(json) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) else {
+            return false;
+        };
+        if sibling_panes_of(&json, &pane_id, MY_VIEW.other()).is_empty() {
+            self.pending_unified_width = None;
+            if let Some(ctl) = &self.pane_ctl {
+                ctl.resize_to(self.last_width, target, self.sidebar_state.dock_right);
+            }
+            return true;
+        }
+        if started.elapsed() >= std::time::Duration::from_secs(2) {
+            self.pending_unified_width = None;
+            self.sidebar_state = sidebar::update_state(|state| {
+                state.merged = false;
+                state.active = MY_VIEW;
+            });
+            self.apply_identity();
+            self.flash = Some(("Explorer stayed open; unified mode cancelled".into(), true));
+        }
+        false
     }
 
     fn pane_is_focused(&self) -> bool {
@@ -846,6 +925,7 @@ impl App {
     pub fn tick(&mut self) {
         let shared = sidebar::load_state();
         self.sidebar_state.git_deco = shared.git_deco;
+        self.sidebar_state.show_git_footer = shared.show_git_footer;
         self.sidebar_state.dock_right = shared.dock_right;
         self.sidebar_state.strict_toggle = shared.strict_toggle;
         self.sidebar_state.focus_on_open = shared.focus_on_open;
@@ -877,7 +957,7 @@ impl App {
                 }
             }
         }
-        if let Some(rx) = &self.syncing {
+        if let Some((_, rx)) = &self.syncing {
             match rx.try_recv() {
                 Ok(Ok(summary)) => {
                     self.flash = Some((summary, false));
@@ -909,8 +989,13 @@ impl App {
         self.refresh();
     }
 
+    pub fn is_syncing(&self) -> bool {
+        self.syncing.is_some()
+    }
+
     pub fn on_resize(&mut self, width: u16) {
         self.last_width = width;
+        let unified_close_completed = self.poll_unified_close();
         if let Some(ctl) = &self.pane_ctl {
             let layout_width = ctl.layout_width();
             let surrounding_changed = self
@@ -918,7 +1003,7 @@ impl App {
                 .zip(layout_width)
                 .is_some_and(|(before, now)| before != now);
             self.last_layout_width = layout_width.or(self.last_layout_width);
-            if surrounding_changed {
+            if !unified_close_completed && surrounding_changed {
                 ctl.resize_preferred(
                     width,
                     self.sidebar_state.sidebar_width,
@@ -1113,12 +1198,19 @@ impl App {
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
         {
-            return Some(Exit::Quit);
+            self.close(false);
+            return None;
         }
         self.flash = None;
         if self.overlay.is_some() {
             self.overlay_key(key);
             return None;
+        }
+        if matches!(key.code, KeyCode::Char('f' | 'F'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            return self.open_search();
         }
         match self.focus {
             Focus::Message => self.on_message_key(key),
@@ -1179,7 +1271,7 @@ impl App {
 
     fn on_button_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Enter | KeyCode::Char(' ') => self.commit(),
+            KeyCode::Enter | KeyCode::Char(' ') => self.run_primary_action(),
             KeyCode::Esc => self.focus = Focus::List,
             KeyCode::Tab | KeyCode::Down => self.focus = Focus::List,
             KeyCode::BackTab | KeyCode::Up => self.focus = Focus::Message,
@@ -1214,6 +1306,7 @@ impl App {
             KeyCode::Char('b') => self.hide(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => return self.switch_to(View::SourceControl),
+            KeyCode::Char('3') => return self.open_search(),
             _ => {}
         }
         None
@@ -1259,6 +1352,9 @@ impl App {
             if within(x, z.explorer) {
                 return self.switch_to(View::Explorer);
             }
+            if within(x, z.search) {
+                return self.open_search();
+            }
             if within(x, z.source_control) {
                 return self.switch_to(View::SourceControl);
             }
@@ -1285,10 +1381,18 @@ impl App {
         }
         if hits(z.button, x, y) {
             self.focus = Focus::Commit;
-            self.commit();
+            self.run_primary_action();
             return None;
         }
         if hits(z.sync, x, y) {
+            self.sync_changes();
+            return None;
+        }
+        if hits(z.header_branch, x, y) || hits(z.git_footer.branch, x, y) {
+            self.open_branch_picker();
+            return None;
+        }
+        if hits(z.git_footer.sync, x, y) {
             self.sync_changes();
             return None;
         }
@@ -1350,8 +1454,16 @@ impl App {
                 }
                 Row::Commit(r) => {
                     // Only the button line commits — not its padding rows.
-                    if line == 1 {
-                        self.commit_repo(r);
+                    if line == 1 && x > 0 && x < self.last_width.saturating_sub(1) {
+                        if self
+                            .repos
+                            .get(r)
+                            .is_some_and(|repo| sync_is_primary(&repo.status))
+                        {
+                            self.sync_repo(r);
+                        } else {
+                            self.commit_repo(r);
+                        }
                     }
                 }
                 Row::RepoHeader(r) => {
@@ -1360,10 +1472,13 @@ impl App {
                     // Right-side action icons: ⟳ sync · ✓ commit (fixed
                     // offsets from the right edge, see repo_header_item).
                     let w = self.last_width;
-                    if x >= w.saturating_sub(3) && x < w {
+                    let (sync_zone, commit_zone) = repo_header_action_zones(w);
+                    if within(x, commit_zone) {
                         self.commit_repo(r);
-                    } else if x >= w.saturating_sub(6) && x < w.saturating_sub(3) {
+                    } else if within(x, sync_zone) {
                         self.sync_repo(r);
+                    } else if within(x, repo_header_branch_zone(&self.repos[r], self.theme, w)) {
+                        self.open_branch_picker_for(r);
                     } else {
                         self.activate();
                     }
@@ -1555,6 +1670,7 @@ impl App {
             AdjustWidth(bool),
             DiscardConfirmed(usize, FileEntry),
             GitConfirmed(usize, Vec<String>),
+            Picker(PickerAction),
         }
         let settings = self.settings_rows();
         let row_count = settings.len();
@@ -1585,20 +1701,19 @@ impl App {
                     Cmd::Nothing
                 }
                 KeyCode::Left | KeyCode::Char('h')
-                    if settings.get(*selected).map(|row| row.0)
-                        == Some(Setting::SidebarWidth) =>
+                    if settings.get(*selected).map(|row| row.0) == Some(Setting::SidebarWidth) =>
                 {
                     Cmd::AdjustWidth(false)
                 }
                 KeyCode::Right | KeyCode::Char('l')
-                    if settings.get(*selected).map(|row| row.0)
-                        == Some(Setting::SidebarWidth) =>
+                    if settings.get(*selected).map(|row| row.0) == Some(Setting::SidebarWidth) =>
                 {
                     Cmd::AdjustWidth(true)
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => Cmd::ToggleSetting(*selected),
                 _ => Cmd::Nothing,
             },
+            Some(Overlay::BranchPicker(picker)) => Cmd::Picker(picker.key(key)),
             Some(Overlay::ConfirmDiscard { repo, entry }) => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     Cmd::DiscardConfirmed(*repo, entry.clone())
@@ -1634,6 +1749,7 @@ impl App {
                 }
                 self.refresh();
             }
+            Cmd::Picker(action) => self.handle_picker_action(action),
         }
     }
 
@@ -1644,6 +1760,7 @@ impl App {
             Activate,
             ToggleSetting(usize),
             Reopen(u16, u16),
+            Picker(PickerAction),
         }
         let row_count = self.settings_rows().len();
         let cmd = match self.overlay.as_mut() {
@@ -1721,6 +1838,7 @@ impl App {
                     _ => Cmd::Nothing,
                 }
             }
+            Some(Overlay::BranchPicker(picker)) => Cmd::Picker(picker.mouse(mouse)),
             // The discard confirm is keyboard-driven (y/N); clicks do nothing.
             _ => Cmd::Nothing,
         };
@@ -1732,6 +1850,41 @@ impl App {
             Cmd::Reopen(x, y) => {
                 self.overlay = None;
                 self.open_context_menu(x, y);
+            }
+            Cmd::Picker(action) => self.handle_picker_action(action),
+        }
+    }
+
+    fn open_branch_picker(&mut self) {
+        self.open_branch_picker_for(self.active);
+    }
+
+    fn open_branch_picker_for(&mut self, repo: usize) {
+        let Some(git) = self.repos.get(repo).map(|repo| repo.git.clone()) else {
+            return;
+        };
+        self.active = repo;
+        match BranchPicker::open(git) {
+            Ok(picker) => self.overlay = Some(Overlay::BranchPicker(picker)),
+            Err(error) => self.flash = Some((error, true)),
+        }
+    }
+
+    fn handle_picker_action(&mut self, action: PickerAction) {
+        match action {
+            PickerAction::None => {}
+            PickerAction::Close => self.overlay = None,
+            PickerAction::Checkout(branch) => {
+                let Some(Overlay::BranchPicker(picker)) = self.overlay.take() else {
+                    return;
+                };
+                match picker.git.checkout_branch(&branch) {
+                    Ok(()) => {
+                        self.flash = Some((format!("switched to {}", branch.name), false));
+                        self.refresh();
+                    }
+                    Err(error) => self.flash = Some((error, true)),
+                }
             }
         }
     }
@@ -1856,6 +2009,17 @@ impl App {
                 true,
             ),
             (
+                Setting::GitFooter,
+                "Git footer",
+                if self.sidebar_state.show_git_footer {
+                    "shown"
+                } else {
+                    "hidden"
+                }
+                .to_string(),
+                true,
+            ),
+            (
                 Setting::Folder,
                 "Change folder…",
                 self.cwd
@@ -1922,6 +2086,11 @@ impl App {
             Setting::GitDecorations => {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.git_deco = !state.git_deco);
+            }
+            Setting::GitFooter => {
+                self.sidebar_state = sidebar::update_state(|state| {
+                    state.show_git_footer = !state.show_git_footer;
+                });
             }
             Setting::Folder => {
                 self.overlay = None;
@@ -2126,7 +2295,7 @@ impl App {
             MenuAction::Reveal => {
                 let rel = entry.path.replace('/', std::path::MAIN_SEPARATOR_STR);
                 let path = repo_root.unwrap_or_else(|| self.cwd.clone()).join(rel);
-                reveal(&path);
+                reveal(&path, false);
             }
             MenuAction::OpenExternal => {
                 let rel = entry.path.replace('/', std::path::MAIN_SEPARATOR_STR);
@@ -2156,7 +2325,7 @@ impl App {
         };
         match action {
             MenuAction::ShowRef => self.open_drawer_ref(kind, index),
-            MenuAction::Reveal => reveal(std::path::Path::new(&spec)),
+            MenuAction::Reveal => reveal(std::path::Path::new(&spec), true),
             MenuAction::RemoveWorktree => self.confirm_git(
                 repo,
                 format!("Remove worktree '{spec}'? (y/N)"),
@@ -2455,7 +2624,10 @@ impl App {
             self.persisted_draft_roots
                 .extend(snapshot.drafts.keys().cloned());
         } else {
-            self.flash = Some(("Could not save Source Control state; action cancelled.".into(), true));
+            self.flash = Some((
+                "Could not save Source Control state; action cancelled.".into(),
+                true,
+            ));
         }
         saved
     }
@@ -2496,16 +2668,20 @@ impl App {
         });
         self.apply_identity();
         if on {
-            // Mirror the detach growth: absorbing the sibling leaves the
-            // survivor at roughly double width — shrink back to one panel.
             let width = self.last_width;
-            self.close_other_standalone_pane();
-            if let Some(ctl) = &self.pane_ctl {
-                ctl.resize_to(
-                    width.saturating_mul(2).saturating_add(1),
-                    width,
-                    self.sidebar_state.dock_right,
-                );
+            match self.close_other_standalone_pane() {
+                Ok(true) => {
+                    self.pending_unified_width = Some((width, std::time::Instant::now()));
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    self.sidebar_state = sidebar::update_state(|state| {
+                        state.merged = false;
+                        state.active = MY_VIEW;
+                    });
+                    self.apply_identity();
+                    self.flash = Some((format!("unified mode cancelled: {error}"), true));
+                }
             }
         } else {
             self.spawn_other_pane();
@@ -2517,25 +2693,49 @@ impl App {
         if !self.merged() || view == MY_VIEW {
             return None;
         }
-        self.sidebar_state = sidebar::update_state(|state| state.active = view);
+        self.sidebar_state = sidebar::update_state(|state| {
+            state.active = view;
+            state.search_active = false;
+        });
         Some(Exit::Switch)
     }
 
-    /// Close the other panel's standalone pane in our tab, if one is open.
-    fn close_other_standalone_pane(&self) {
-        let Some(ctl) = &self.pane_ctl else { return };
-        let Ok(json) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) else {
-            return;
-        };
-        for id in sibling_panes_of(&json, &ctl.pane_id, MY_VIEW.other()) {
-            let _ =
-                herdr_sidebar::ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }));
+    fn open_search(&mut self) -> Option<Exit> {
+        if !self.merged() {
+            return None;
         }
+        self.sidebar_state = sidebar::update_state(|state| {
+            state.active = View::Explorer;
+            state.search_active = true;
+        });
+        Some(Exit::Search)
+    }
+
+    /// Close the other panel's standalone pane in our tab, if one is open.
+    fn close_other_standalone_pane(&self) -> std::io::Result<bool> {
+        let Some(ctl) = &self.pane_ctl else {
+            return Ok(false);
+        };
+        let json = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({}))?;
+        let ids = sibling_panes_of(&json, &ctl.pane_id, MY_VIEW.other());
+        if ids.is_empty() {
+            return Ok(false);
+        }
+        let mut failure = None;
+        for id in ids {
+            if let Err(error) = herdr_sidebar::ensure::request_close(&json, &id) {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(true), Err)
     }
 
     /// Open the other view in a fresh pane beside this one (detach).
     fn spawn_other_pane(&self) {
         let (Some(ctl), Some(_)) = (&self.pane_ctl, &self.other_exe) else {
+            return;
+        };
+        let Some(_lock) = herdr_sidebar::ensure::LaunchLock::acquire(true) else {
             return;
         };
         // Grow to double width FIRST, then split 50/50 — each separated panel
@@ -2545,33 +2745,46 @@ impl App {
             self.last_width.saturating_mul(2).saturating_add(1),
             self.sidebar_state.dock_right,
         );
-        let response = herdr_sidebar::ipc::call_text(
-            "pane.split",
-            serde_json::json!({
-                "target_pane_id": ctl.pane_id,
-                "direction": "right",
-                "ratio": 0.5,
-                "focus": false,
-                "cwd": self.cwd.display().to_string(),
-                "env": sidebar::spawn_env(),
-            }),
-        );
-        let Some(new_pane) = response
-            .ok()
-            .and_then(|r| herdr_sidebar::launch::split_pane_id(&r))
-        else {
-            return;
-        };
-        let flag = MY_VIEW.other().view_flag();
-        let command = format!("{} --view {flag}", sidebar::EXECUTABLE_NAME);
-        let _ = herdr_sidebar::ipc::call_text(
-            "pane.send_input",
-            serde_json::json!({ "pane_id": new_pane, "text": command, "keys": ["Enter"] }),
-        );
-        let _ = herdr_sidebar::ipc::call_text(
-            "pane.rename",
-            serde_json::json!({ "pane_id": new_pane, "label": MY_VIEW.other().label() }),
-        );
+        let other = MY_VIEW.other();
+        #[cfg(unix)]
+        let _ = herdr_sidebar::ipc::open_plugin_pane(&ctl.pane_id, other, &self.cwd, false);
+        #[cfg(windows)]
+        {
+            let response = herdr_sidebar::ipc::call_text(
+                "pane.split",
+                serde_json::json!({
+                    "target_pane_id": ctl.pane_id,
+                    "direction": "right",
+                    "ratio": 0.5,
+                    "focus": false,
+                    "cwd": self.cwd.display().to_string(),
+                    "env": sidebar::spawn_env(),
+                }),
+            );
+            let Some(new_pane) = response
+                .ok()
+                .and_then(|r| herdr_sidebar::launch::split_pane_id(&r))
+            else {
+                return;
+            };
+            if herdr_sidebar::ipc::report_starting_identity(&new_pane, other, false).is_err() {
+                let _ = herdr_sidebar::ipc::call_text(
+                    "pane.close",
+                    serde_json::json!({ "pane_id": new_pane }),
+                );
+                return;
+            }
+            let flag = other.view_flag();
+            let command = format!("{} --view {flag}", sidebar::EXECUTABLE_NAME);
+            let _ = herdr_sidebar::ipc::call_text(
+                "pane.send_input",
+                serde_json::json!({ "pane_id": new_pane, "text": command, "keys": ["Enter"] }),
+            );
+            let _ = herdr_sidebar::ipc::call_text(
+                "pane.rename",
+                serde_json::json!({ "pane_id": new_pane, "label": other.label() }),
+            );
+        }
     }
 
     // ---- Git operations ----
@@ -2736,11 +2949,22 @@ impl App {
         std::thread::spawn(move || {
             let _ = tx.send(git.sync());
         });
-        self.syncing = Some(rx);
+        self.syncing = Some((index, rx));
     }
 
     fn commit(&mut self) {
         self.commit_repo(self.active);
+    }
+
+    fn run_primary_action(&mut self) {
+        if self
+            .active_repo()
+            .is_some_and(|repo| sync_is_primary(&repo.status))
+        {
+            self.sync_changes();
+        } else {
+            self.commit();
+        }
     }
 
     fn commit_repo(&mut self, index: usize) {
@@ -2868,8 +3092,16 @@ impl App {
             2 + self.single_message_rows(area.width) as u16
         };
         let button_height = if multi { 0 } else { 3 };
-        let sync_height = u16::from(!multi && self.sync_label().is_some());
+        let sync_height = u16::from(
+            !multi
+                && self.sync_label().is_some()
+                && !self
+                    .active_repo()
+                    .is_some_and(|repo| sync_is_primary(&repo.status)),
+        );
         let footer_lines = self.footer_lines(area.width);
+        let git_footer = self.sidebar_state.show_git_footer && self.active_repo().is_some();
+        let menu_hint = git_footer && footer_lines.is_empty();
         // A breathing row above and below the icons keeps the activity bar
         // from crowding the pane border.
         let activity_height = if self.merged() { 3 } else { 0 };
@@ -2880,7 +3112,10 @@ impl App {
             Constraint::Length(button_height),
             Constraint::Length(sync_height),
             Constraint::Min(0),
-            Constraint::Length((footer_lines.len() as u16).max(1)),
+            Constraint::Length(
+                (footer_lines.len() as u16 + 2 * u16::from(menu_hint) + u16::from(git_footer))
+                    .max(1),
+            ),
         ])
         .areas(area);
         self.page = list.height.saturating_sub(1).max(1) as usize;
@@ -2901,7 +3136,17 @@ impl App {
         }
         self.draw_list(frame, list);
         let footer_empty = footer_lines.is_empty();
-        frame.render_widget(Paragraph::new(footer_lines), footer);
+        let content_height = footer.height.saturating_sub(u16::from(git_footer));
+        let footer_content = Rect::new(footer.x, footer.y, footer.width, content_height);
+        frame.render_widget(Paragraph::new(footer_lines), footer_content);
+        if menu_hint {
+            frame.render_widget(
+                Paragraph::new("m / ctrl+rclick for menus")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Right),
+                footer_content,
+            );
+        }
         // Collapse button at the bottom-right of the last footer line,
         // mirroring the explorer (and herdr's own sidebar).
         let last_line = Rect::new(
@@ -2910,7 +3155,25 @@ impl App {
             footer.width,
             1,
         );
-        if footer_empty {
+        self.zones.git_footer = FooterZones::default();
+        if git_footer {
+            let status_area = Rect::new(
+                last_line.x,
+                last_line.y,
+                last_line.width.saturating_sub(3),
+                1,
+            );
+            if let Some(status) = self.active_repo().map(|repo| repo.status.clone()) {
+                self.zones.git_footer = draw_git_footer(
+                    frame,
+                    status_area,
+                    self.theme,
+                    &status,
+                    self.syncing.is_some(),
+                    self.mouse_pos,
+                );
+            }
+        } else if footer_empty {
             frame.render_widget(
                 Paragraph::new(Span::styled(
                     " m / ctrl+rclick: menu",
@@ -2931,6 +3194,11 @@ impl App {
         );
 
         match self.overlay {
+            Some(Overlay::BranchPicker(_)) => {
+                if let Some(Overlay::BranchPicker(picker)) = self.overlay.as_mut() {
+                    picker.draw(frame);
+                }
+            }
             Some(Overlay::Menu { .. }) => self.draw_menu(frame),
             Some(Overlay::Settings { .. }) => self.draw_settings(frame),
             _ => {}
@@ -2947,14 +3215,7 @@ impl App {
         let outer_top = area.y;
         let outer_bottom = area.y + 2;
         let area = Rect::new(area.x, area.y + 1, area.width, 1);
-        let (exp_icon, git_icon) = activity_icons(self.theme);
-        let active = |on: bool| {
-            if on {
-                selection_style(true)
-            } else {
-                Style::default().dim()
-            }
-        };
+        let (exp_icon, search_icon, git_icon) = activity_icons(self.theme);
         // Both FA glyphs (folder, code-fork) render two cells wide in the
         // non-Mono Nerd Font; reserve the second cell in each chip so the
         // highlights are equal-sized with centered icons.
@@ -2963,11 +3224,13 @@ impl App {
         } else {
             ""
         };
-        let spans = [
+        let mut spans = [
             Span::raw(" "),
-            Span::styled(format!(" {exp_icon}{slack} "), active(false)),
+            Span::raw(format!(" {exp_icon}{slack} ")),
             Span::raw(" "),
-            Span::styled(format!(" {git_icon}{slack} "), active(true)),
+            Span::raw(format!(" {search_icon}{slack} ")),
+            Span::raw(" "),
+            Span::raw(format!(" {git_icon}{slack} ")),
         ];
         // Hit zones from the actual span widths (emoji vs nerd-glyph widths differ).
         let mut x = area.x;
@@ -2979,24 +3242,56 @@ impl App {
         }
         self.zones.activity_row = area.y;
         self.zones.explorer = bounds[1];
-        self.zones.source_control = bounds[3];
-        // Symmetric half-block caps: a 2-cell button with the icon in its
-        // vertical center.
-        let (chip_start, chip_end) = bounds[3];
-        let chip_w = chip_end.saturating_sub(chip_start);
-        let cap = |glyph: &str| {
-            Paragraph::new(glyph.repeat(usize::from(chip_w)))
-                .style(Style::default().fg(palette().selection_bg))
+        self.zones.search = bounds[3];
+        self.zones.source_control = bounds[5];
+        let hovered = |(start, end): (u16, u16)| {
+            self.mouse_pos.is_some_and(|(x, y)| {
+                (outer_top..=outer_bottom).contains(&y) && (start..end).contains(&x)
+            })
         };
-        frame.render_widget(cap("▄"), Rect::new(chip_start, outer_top, chip_w, 1));
-        frame.render_widget(cap("▀"), Rect::new(chip_start, outer_bottom, chip_w, 1));
-        let gear = Span::styled(
-            format!(" {} ", gear_icon(self.theme)),
-            Style::default().dim(),
+        let explorer_hovered = hovered(bounds[1]);
+        let search_hovered = hovered(bounds[3]);
+        let git_hovered = hovered(bounds[5]);
+        spans[1].style = activity_button_style(false, explorer_hovered);
+        spans[3].style = activity_button_style(false, search_hovered);
+        spans[5].style = activity_button_style(true, git_hovered);
+        draw_activity_caps(
+            frame,
+            bounds[5],
+            outer_top,
+            outer_bottom,
+            palette().selection_bg,
         );
-        let gear_w = gear.width() as u16;
+        for (is_hovered, button_bounds) in
+            [(explorer_hovered, bounds[1]), (search_hovered, bounds[3])]
+        {
+            if is_hovered {
+                draw_activity_caps(
+                    frame,
+                    button_bounds,
+                    outer_top,
+                    outer_bottom,
+                    palette().activity_hover_bg,
+                );
+            }
+        }
+        let gear_text = format!(" {} ", gear_icon(self.theme));
+        let gear_w = Span::raw(gear_text.as_str()).width() as u16;
         let gear_x = area.x + area.width.saturating_sub(gear_w);
         self.zones.gear = Rect::new(gear_x, area.y, gear_w, 1);
+        let gear_hovered = self.mouse_pos.is_some_and(|(x, y)| {
+            (gear_x..gear_x + gear_w).contains(&x) && (outer_top..=outer_bottom).contains(&y)
+        });
+        let gear = Span::styled(gear_text, activity_button_style(false, gear_hovered));
+        if gear_hovered {
+            draw_activity_caps(
+                frame,
+                (gear_x, gear_x + gear_w),
+                outer_top,
+                outer_bottom,
+                palette().activity_hover_bg,
+            );
+        }
 
         let pad = usize::from(area.width)
             .saturating_sub(spans.iter().map(Span::width).sum::<usize>() + usize::from(gear_w));
@@ -3060,10 +3355,24 @@ impl App {
         let avail = (area.width as usize)
             .saturating_sub(left.width() + actions_w + gear_w)
             .saturating_sub(1);
-        let branch = Span::styled(truncate_to(right_text, avail), Style::default().dim());
+        let branch_text = truncate_to(right_text, avail);
+        let branch_width = Span::raw(branch_text.as_str()).width();
         let pad = (area.width as usize)
-            .saturating_sub(left.width() + branch.width() + actions_w + gear_w)
+            .saturating_sub(left.width() + branch_width + actions_w + gear_w)
             .max(1);
+        let branch_x = area.x + left.width() as u16 + pad as u16;
+        self.zones.header_branch = Rect::new(branch_x, area.y, branch_width as u16, 1);
+        let branch_hovered = self
+            .mouse_pos
+            .is_some_and(|(x, y)| hits(self.zones.header_branch, x, y));
+        let branch = Span::styled(
+            branch_text,
+            if branch_hovered {
+                hover_style()
+            } else {
+                Style::default().dim()
+            },
+        );
         let mut spans = vec![left, Span::raw(" ".repeat(pad)), branch];
         spans.extend(action_spans);
         if let Some(gear) = gear {
@@ -3145,35 +3454,44 @@ impl App {
         }
         // A breathing row above and below, like the inline variant.
         let inner = if area.height >= 3 {
-            Rect::new(area.x, area.y + 1, area.width, 1)
+            Rect::new(
+                area.x.saturating_add(1),
+                area.y + 1,
+                area.width.saturating_sub(2),
+                1,
+            )
         } else {
             area
         };
-        frame.render_widget(Paragraph::new("✓ Commit").centered().style(style), inner);
+        let label = if self
+            .active_repo()
+            .is_some_and(|repo| sync_is_primary(&repo.status))
+        {
+            self.sync_label()
+                .unwrap_or_else(|| "⟳ Sync Changes".to_string())
+        } else {
+            "✓ Commit".to_string()
+        };
+        frame.render_widget(Paragraph::new(label).centered().style(style), inner);
         self.zones.button = inner;
     }
 
     /// The Sync Changes label, or `None` while there is nothing to sync
     /// (which hides the row entirely).
     fn sync_label(&self) -> Option<String> {
-        if self.syncing.is_some() {
-            return Some("⇅ Syncing…".to_string());
-        }
         let status = &self.active_repo()?.status;
-        if !status.has_upstream || status.ahead + status.behind == 0 {
-            return None;
-        }
-        Some(format!(
-            "⇅ Sync Changes  {}↑ {}↓",
-            status.ahead, status.behind
-        ))
+        let syncing = self
+            .syncing
+            .as_ref()
+            .is_some_and(|(repo, _)| *repo == self.active);
+        sync_label_for_status(status, syncing)
     }
 
     /// A secondary button below Commit, VS Code's Sync Changes: pull + push
     /// with the outgoing↑ / incoming↓ counts.
     fn draw_sync(&mut self, frame: &mut Frame, area: Rect) {
-        self.zones.sync = area;
         let Some(label) = self.sync_label() else {
+            self.zones.sync = Rect::default();
             return;
         };
         let style = if self.syncing.is_some() {
@@ -3181,18 +3499,25 @@ impl App {
                 .bg(palette().sync_busy_bg)
                 .fg(palette().muted_button_fg)
         } else {
-            Style::default()
-                .bg(palette().sync_bg)
-                .fg(palette().sync_fg)
+            Style::default().bg(palette().sync_bg).fg(palette().sync_fg)
         };
-        frame.render_widget(Paragraph::new(label).centered().style(style), area);
+        let inner = Rect::new(
+            area.x.saturating_add(1),
+            area.y,
+            area.width.saturating_sub(2),
+            area.height,
+        );
+        self.zones.sync = inner;
+        frame.render_widget(Paragraph::new(label).centered().style(style), inner);
     }
 
     fn draw_list(&mut self, frame: &mut Frame, area: Rect) {
         let width = area.width as usize;
         let theme = self.theme;
         let hovered = self.hovered;
+        let mouse_pos = self.mouse_pos;
         let active = self.active;
+        let syncing_repo = self.syncing.as_ref().map(|(repo, _)| *repo);
 
         // Clamp the scroll and (keyboard nav only) walk it forward until the
         // selection fits — rows have variable heights.
@@ -3238,7 +3563,14 @@ impl App {
                 let row_hovered = hovered == Some(i);
                 let item = match *row {
                     Row::RepoHeader(r) => {
-                        repo_header_item(&self.repos[r], r == active, theme, width)
+                        let branch_hovered = row_hovered
+                            && mouse_pos.is_some_and(|(x, _)| {
+                                within(
+                                    x,
+                                    repo_header_branch_zone(&self.repos[r], theme, width as u16),
+                                )
+                            });
+                        repo_header_item(&self.repos[r], r == active, theme, width, branch_hovered)
                     }
                     Row::Message(r) => message_box_item(
                         &self.repos[r],
@@ -3247,6 +3579,8 @@ impl App {
                         width,
                     ),
                     Row::Commit(r) => commit_button_item(
+                        &self.repos[r].status,
+                        syncing_repo == Some(r),
                         r == active,
                         r == active && self.focus == Focus::Commit,
                         width,
@@ -3457,9 +3791,7 @@ impl App {
                 MenuEntry::Action(_, label) => {
                     let line = Line::raw(format!(" {label}"));
                     if i == *selected {
-                        ListItem::new(line).style(
-                            selection_style(true),
-                        )
+                        ListItem::new(line).style(selection_style(true))
                     } else {
                         ListItem::new(line)
                     }
@@ -3498,6 +3830,7 @@ fn repo_header_item(
     active: bool,
     theme: IconTheme,
     width: usize,
+    branch_hovered: bool,
 ) -> ListItem<'static> {
     let arrow = if repo.collapsed { "▸" } else { "▾" };
     let repo_icon = icon(theme, "", true, false);
@@ -3506,29 +3839,82 @@ fn repo_header_item(
     } else {
         Style::default().dim().bold()
     };
-    let left = vec![
-        Span::styled(format!(" {arrow} "), Style::default().bold()),
-        Span::raw(format!("{} ", repo_icon.glyph)),
-        Span::styled(repo.name.clone(), name_style),
-    ];
     let s = &repo.status;
     let counts = if s.ahead + s.behind > 0 {
         format!(" {}↑ {}↓", s.ahead, s.behind)
     } else {
         String::new()
     };
-    let branch = Span::styled(
-        format!("{} {}{}", branch_icon(theme), repo.branch_decor(), counts),
-        Style::default().dim(),
+    let branch_text = format!("{} {}{}", branch_icon(theme), repo.branch_decor(), counts);
+    let full_icons_width = Span::raw(REPO_HEADER_ACTIONS).width();
+    let icons_width = if width >= full_icons_width {
+        full_icons_width
+    } else {
+        0
+    };
+    let content_width = width.saturating_sub(icons_width);
+    let branch_width = Span::raw(branch_text.as_str())
+        .width()
+        .min(content_width / 2);
+    let left_width = content_width.saturating_sub(branch_width);
+    let left = truncate_to(
+        format!(" {arrow} {} {}", repo_icon.glyph, repo.name),
+        left_width,
     );
-    let icons = Span::styled(" ⇅  ✓ ", Style::default().dim());
-    let used: usize = left.iter().map(Span::width).sum::<usize>() + branch.width() + icons.width();
-    let pad = width.saturating_sub(used).max(1);
-    let mut spans = left;
-    spans.push(Span::raw(" ".repeat(pad)));
-    spans.push(branch);
-    spans.push(icons);
-    ListItem::new(Line::from(spans))
+    let branch = truncate_to(branch_text, branch_width);
+    let left_pad = left_width.saturating_sub(Span::raw(left.as_str()).width());
+    let branch_pad = branch_width.saturating_sub(Span::raw(branch.as_str()).width());
+    ListItem::new(Line::from(vec![
+        Span::styled(left, name_style),
+        Span::raw(" ".repeat(left_pad + branch_pad)),
+        Span::styled(
+            branch,
+            if branch_hovered {
+                hover_style()
+            } else {
+                Style::default().dim()
+            },
+        ),
+        Span::styled(
+            truncate_to(REPO_HEADER_ACTIONS.to_string(), icons_width),
+            Style::default().dim(),
+        ),
+    ]))
+}
+
+fn repo_header_branch_zone(repo: &Repo, theme: IconTheme, width: u16) -> (u16, u16) {
+    let counts = if repo.status.ahead + repo.status.behind > 0 {
+        format!(" {}↑ {}↓", repo.status.ahead, repo.status.behind)
+    } else {
+        String::new()
+    };
+    let full_icons_width = Span::raw(REPO_HEADER_ACTIONS).width();
+    let icons_width = if usize::from(width) >= full_icons_width {
+        full_icons_width
+    } else {
+        0
+    };
+    let content_width = usize::from(width).saturating_sub(icons_width);
+    let branch_width = Span::raw(format!(
+        "{} {}{}",
+        branch_icon(theme),
+        repo.branch_decor(),
+        counts
+    ))
+    .width()
+    .min(content_width / 2);
+    let start = content_width.saturating_sub(branch_width) as u16;
+    (start, start + branch_width as u16)
+}
+
+fn repo_header_action_zones(width: u16) -> ((u16, u16), (u16, u16)) {
+    let actions_width = Span::raw(REPO_HEADER_ACTIONS).width() as u16;
+    if width < actions_width {
+        return ((0, 0), (0, 0));
+    }
+    let start = width - actions_width;
+    let midpoint = start + actions_width / 2;
+    ((start, midpoint), (midpoint, width))
 }
 
 /// Columns the inline message box's input field spans (between the left
@@ -3635,16 +4021,30 @@ fn message_box_item(
 
 /// A repo's inline ✓ Commit button with the VS Code dropdown chevron at its
 /// right end; only the active repo's button is fully lit.
-fn commit_button_item(active: bool, focused: bool, width: usize) -> ListItem<'static> {
+fn commit_button_item(
+    status: &Status,
+    syncing: bool,
+    active: bool,
+    focused: bool,
+    width: usize,
+) -> ListItem<'static> {
     let (bg, fg) = match (active, focused) {
         (true, true) => (palette().button_focus_bg, palette().button_fg),
         (true, false) => (palette().button_bg, palette().button_fg),
         (false, _) => (palette().muted_button_bg, palette().muted_button_fg),
     };
-    let label = "✓ Commit";
-    let body_w = width.saturating_sub(2);
-    let left_pad = body_w.saturating_sub(label.chars().count()) / 2;
-    let right_pad = body_w.saturating_sub(left_pad + label.chars().count());
+    let label = if sync_is_primary(status) {
+        sync_label_for_status(status, syncing).unwrap_or_else(|| "⟳ Sync Changes".to_string())
+    } else {
+        "✓ Commit".to_string()
+    };
+    let button_width = width.saturating_sub(2);
+    let dropdown_width = usize::from(button_width >= 2) * 2;
+    let body_width = button_width.saturating_sub(dropdown_width);
+    let label = truncate_to(label, body_width);
+    let label_width = Span::raw(label.as_str()).width();
+    let left_pad = body_width.saturating_sub(label_width) / 2;
+    let right_pad = body_width.saturating_sub(left_pad + label_width);
     let mut style = Style::default().bg(bg).fg(fg);
     if focused {
         style = style.add_modifier(Modifier::BOLD);
@@ -3652,11 +4052,13 @@ fn commit_button_item(active: bool, focused: bool, width: usize) -> ListItem<'st
     ListItem::new(vec![
         Line::default(),
         Line::from(vec![
+            Span::raw(" "),
             Span::styled(
                 format!("{}{label}{}", " ".repeat(left_pad), " ".repeat(right_pad)),
                 style,
             ),
-            Span::styled("│∨", style.dim()),
+            Span::styled(if dropdown_width == 2 { "│∨" } else { "" }, style.dim()),
+            Span::raw(" "),
         ]),
         Line::default(),
     ])
@@ -3786,6 +4188,45 @@ fn pane_focused_in(pane_list_json: &str, pane_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_diverged_repo_uses_sync_as_the_primary_action() {
+        let status = Status {
+            ahead: 43,
+            has_upstream: true,
+            ..Status::default()
+        };
+        assert!(sync_is_primary(&status));
+
+        let dirty = Status {
+            unstaged: vec![FileEntry {
+                path: "README.md".into(),
+                orig: None,
+                letter: 'M',
+            }],
+            ..status
+        };
+        assert!(!sync_is_primary(&dirty));
+    }
+
+    #[test]
+    fn sync_label_omits_zero_counts() {
+        let status = Status {
+            ahead: 43,
+            has_upstream: true,
+            ..Status::default()
+        };
+        assert_eq!(
+            sync_label_for_status(&status, false).as_deref(),
+            Some("⟳ Sync Changes 43↑")
+        );
+    }
+
+    #[test]
+    fn narrow_repo_headers_disable_hidden_action_zones() {
+        assert_eq!(repo_header_action_zones(4), ((0, 0), (0, 0)));
+        assert_eq!(repo_header_action_zones(6), ((0, 3), (3, 6)));
+    }
 
     #[test]
     fn any_commit_message_pauses_cwd_follow() {

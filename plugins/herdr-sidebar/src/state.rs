@@ -14,6 +14,7 @@
 //! separated panes are the same binary pinned to a starting view with
 //! `--view`.
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 /// Pane label (and metadata identity) of the unified pane.
@@ -33,7 +34,9 @@ pub fn step_sidebar_width(width: u16, wider: bool) -> u16 {
     if wider {
         (width + SIDEBAR_WIDTH_STEP).min(MAX_SIDEBAR_WIDTH)
     } else {
-        width.saturating_sub(SIDEBAR_WIDTH_STEP).max(MIN_SIDEBAR_WIDTH)
+        width
+            .saturating_sub(SIDEBAR_WIDTH_STEP)
+            .max(MIN_SIDEBAR_WIDTH)
     }
 }
 
@@ -41,6 +44,11 @@ pub fn step_sidebar_width(width: u16, wider: bool) -> u16 {
 /// prepends this binary's directory to PATH, so PowerShell, cmd, sh, bash,
 /// nushell, and pwsh all resolve the same bare executable name.
 pub const EXECUTABLE_NAME: &str = "herdr-sidebar";
+
+/// Desired working directory for a directly spawned plugin pane. Herdr 0.8.2
+/// resolves relative pane commands against the requested cwd, so launchers
+/// keep the process cwd at the plugin root and let the TUI move here itself.
+pub const SPAWN_CWD_ENV: &str = "HERDR_SIDEBAR_SPAWN_CWD";
 
 /// The viewer's control path travels in the pane environment rather than in
 /// a shell-quoted argv. Paths can contain spaces and every supported shell
@@ -67,6 +75,7 @@ pub enum Exit {
     Quit,
     /// The user picked the other view — main re-renders in process.
     Switch,
+    Search,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -104,6 +113,15 @@ impl View {
         match self {
             View::Explorer => "explorer",
             View::SourceControl => "git",
+        }
+    }
+
+    /// Manifest pane entrypoint that starts this view without an intermediary
+    /// shell, avoiding a prompt flash while the TUI boots.
+    pub fn entrypoint(self) -> &'static str {
+        match self {
+            View::Explorer => "sidebar",
+            View::SourceControl => "source-control",
         }
     }
 
@@ -229,9 +247,15 @@ impl PreviewPlacement {
 pub struct State {
     pub merged: bool,
     pub active: View,
+    /// Restore the Search activity rather than the Explorer tree when the
+    /// unified sidebar is reopened. Search shares the Explorer process.
+    pub search_active: bool,
     /// Show the hotkey chips at the bottom of the sidebar (they always
     /// live in the ⚙ Settings modal; the footer copy is opt-in).
     pub show_hotkeys: bool,
+    /// Show the compact branch + sync strip at the bottom while the current
+    /// folder belongs to a Git repository.
+    pub show_git_footer: bool,
     /// The user's explicit icon-theme choice; `None` = auto (Nerd Font
     /// probe). Set the moment they toggle `i` or the Settings row, so a
     /// wrong auto-guess is corrected once and stays corrected.
@@ -271,6 +295,9 @@ pub struct State {
     /// Whether a clicked file opens in its own tab or in a viewer pane beside
     /// the sidebar, inside the tab the click came from.
     pub preview_placement: PreviewPlacement,
+    /// Replace mouse-click previews with the configured terminal editor.
+    /// Keyboard Enter always retains the built-in preview path.
+    pub custom_editor_on_click: bool,
 }
 
 impl Default for State {
@@ -278,7 +305,9 @@ impl Default for State {
         Self {
             merged: true,
             active: View::Explorer,
+            search_active: false,
             show_hotkeys: false,
+            show_git_footer: true,
             icons: None,
             color_theme: ColorTheme::VsCode,
             font_prompt_done: false,
@@ -290,6 +319,7 @@ impl Default for State {
             dock_right: false,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             preview_placement: PreviewPlacement::Tab,
+            custom_editor_on_click: false,
         }
     }
 }
@@ -310,6 +340,35 @@ pub fn follow_cwd_setting_value(enabled: bool) -> String {
 /// the conventional location herdr resolves it to.
 pub fn state_path() -> Option<PathBuf> {
     Some(state_dir()?.join("state.json"))
+}
+
+fn editor_command_path() -> Option<PathBuf> {
+    Some(state_dir()?.join("editor-command.txt"))
+}
+
+pub fn load_editor_command() -> Option<String> {
+    let command = std::fs::read_to_string(editor_command_path()?).ok()?;
+    let command = command.trim().to_string();
+    (!command.is_empty()).then_some(command)
+}
+
+pub fn save_editor_command(command: &str) -> bool {
+    let command = command.trim();
+    if command.is_empty() || command.len() > 1024 || command.contains(['\r', '\n']) {
+        return false;
+    }
+    let Some(path) = editor_command_path() else {
+        return false;
+    };
+    if let Some(dir) = path.parent()
+        && std::fs::create_dir_all(dir).is_err()
+    {
+        return false;
+    }
+    let Some(_lock) = StateWriteLock::acquire(&path) else {
+        return false;
+    };
+    std::fs::write(path, command).is_ok()
 }
 
 fn state_dir() -> Option<PathBuf> {
@@ -426,10 +485,12 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\"{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
+        state.search_active,
         state.show_hotkeys,
+        state.show_git_footer,
         state.font_prompt_done,
         state.auto_open,
         state.strict_toggle,
@@ -439,47 +500,28 @@ fn write_state(path: &Path, state: State) {
         state.dock_right,
         clamp_sidebar_width(state.sidebar_width),
         state.color_theme.label(),
-        state.preview_placement.label()
+        state.preview_placement.label(),
+        state.custom_editor_on_click
     );
     let _ = std::fs::write(path, json);
 }
 
 struct StateWriteLock {
-    path: PathBuf,
+    _file: File,
 }
 
 impl StateWriteLock {
     fn acquire(state_path: &Path) -> Option<Self> {
         let path = state_path.with_extension("lock");
-        for _ in 0..50 {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return Some(Self { path }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = std::fs::metadata(&path)
-                        .and_then(|meta| meta.modified())
-                        .ok()
-                        .and_then(|modified| modified.elapsed().ok())
-                        .is_some_and(|age| age > std::time::Duration::from_secs(5));
-                    if stale {
-                        let _ = std::fs::remove_file(&path);
-                    } else {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                }
-                Err(_) => return None,
-            }
-        }
-        None
-    }
-}
-
-impl Drop for StateWriteLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .ok()?;
+        file.lock().ok()?;
+        Some(Self { _file: file })
     }
 }
 
@@ -726,10 +768,7 @@ pub fn save_scm_state(cwd: &Path, state: &ScmState) -> bool {
         .is_some_and(|json| std::fs::write(path, json).is_ok())
 }
 
-fn merge_scm_drafts(
-    stored: &mut std::collections::BTreeMap<String, String>,
-    state: &ScmState,
-) {
+fn merge_scm_drafts(stored: &mut std::collections::BTreeMap<String, String>, state: &ScmState) {
     for root in &state.cleared_drafts {
         stored.remove(root);
     }
@@ -823,10 +862,18 @@ pub fn parse_state(json: &str) -> State {
             .and_then(|v| v.as_str())
             .and_then(View::from_state_name)
             .unwrap_or(default.active),
+        search_active: value
+            .get("search_active")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.search_active),
         show_hotkeys: value
             .get("hotkeys")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.show_hotkeys),
+        show_git_footer: value
+            .get("git_footer")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.show_git_footer),
         icons: value
             .get("icons")
             .and_then(|v| v.as_str())
@@ -875,6 +922,10 @@ pub fn parse_state(json: &str) -> State {
             .and_then(|v| v.as_str())
             .and_then(PreviewPlacement::from_state_name)
             .unwrap_or(default.preview_placement),
+        custom_editor_on_click: value
+            .get("custom_editor_on_click")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.custom_editor_on_click),
     }
 }
 
@@ -955,7 +1006,10 @@ mod tests {
         assert_eq!(state.drawers, vec!["CHANGES"]);
         assert_eq!(state.active_root.as_deref(), Some("C:/repo"));
         assert_eq!(state.scroll, 4);
-        assert_eq!(state.drafts.get("C:/repo").map(String::as_str), Some("keep me"));
+        assert_eq!(
+            state.drafts.get("C:/repo").map(String::as_str),
+            Some("keep me")
+        );
         assert_eq!(scm_path_key(Path::new(r"C:\repo\src")), "C:/repo/src");
     }
 
@@ -966,9 +1020,7 @@ mod tests {
             ("/repo/b".to_string(), "draft to clear".to_string()),
         ]);
         let mut state = ScmState::default();
-        state
-            .cleared_drafts
-            .insert("/repo/b".to_string());
+        state.cleared_drafts.insert("/repo/b".to_string());
 
         merge_scm_drafts(&mut stored, &state);
 
@@ -1003,7 +1055,9 @@ mod tests {
         let state = State {
             merged: true,
             active: View::SourceControl,
+            search_active: true,
             show_hotkeys: true,
+            show_git_footer: false,
             icons: Some(crate::icons::IconTheme::Emoji),
             color_theme: ColorTheme::Terminal,
             font_prompt_done: true,
@@ -1015,8 +1069,9 @@ mod tests {
             dock_right: true,
             sidebar_width: 44,
             preview_placement: PreviewPlacement::Pane,
+            custom_editor_on_click: true,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git
@@ -1051,6 +1106,7 @@ mod tests {
         // Existing installs get neighbour following by default.
         assert!(parse_state("{\"merged\":true}").follow_cwd);
         assert!(parse_state("{\"merged\":true}").git_deco);
+        assert!(parse_state("{\"merged\":true}").show_git_footer);
         // Files written before the dock setting existed stay left-docked.
         assert!(!parse_state("{\"merged\":true}").dock_right);
         assert_eq!(parse_state("{\"merged\":true}").sidebar_width, 32);
@@ -1079,8 +1135,14 @@ mod tests {
     fn sidebar_width_steps_and_saturates_within_supported_bounds() {
         assert_eq!(step_sidebar_width(32, true), 36);
         assert_eq!(step_sidebar_width(32, false), 28);
-        assert_eq!(step_sidebar_width(MAX_SIDEBAR_WIDTH, true), MAX_SIDEBAR_WIDTH);
-        assert_eq!(step_sidebar_width(MIN_SIDEBAR_WIDTH, false), MIN_SIDEBAR_WIDTH);
+        assert_eq!(
+            step_sidebar_width(MAX_SIDEBAR_WIDTH, true),
+            MAX_SIDEBAR_WIDTH
+        );
+        assert_eq!(
+            step_sidebar_width(MIN_SIDEBAR_WIDTH, false),
+            MIN_SIDEBAR_WIDTH
+        );
         assert_eq!(step_sidebar_width(1, true), 28);
         assert_eq!(step_sidebar_width(u16::MAX, false), 76);
     }
@@ -1102,6 +1164,8 @@ mod tests {
         assert_eq!(View::SourceControl.other(), View::Explorer);
         assert_eq!(View::Explorer.label(), "Explorer");
         assert_eq!(View::SourceControl.plugin_id(), "herdr-sidebar-git");
+        assert_eq!(View::Explorer.entrypoint(), "sidebar");
+        assert_eq!(View::SourceControl.entrypoint(), "source-control");
     }
 
     #[test]

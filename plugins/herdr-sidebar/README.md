@@ -3,14 +3,23 @@
 **The sidebar your terminal was missing** — a VS Code-inspired file explorer + source
 control panel in one dockable herdr pane.
 
-<img src="docs/media/hero.png" alt="The sidebar Explorer and live preview interface" width="860">
+<img src="docs/media/hero.png" alt="The sidebar Source Control view beside a grid of coding agents" width="860">
 
 **The full tour lives in the [repo README](../../README.md)** — features, screenshots,
 keys, and settings.
 
+Quick Open is `Ctrl+P`; project text search has its own activity view and opens with `Ctrl+F`
+or `Ctrl+Shift+F`. It searches live with match-case, whole-word, regex, and include/exclude filters.
+The Git footer keeps branch switching and sync one click away in every view and can be hidden
+from Settings.
+Common image formats render directly in the preview pane; videos show a poster frame when
+`ffmpeg` is available on `PATH`.
+To open clicked files in a terminal editor, configure "Custom editor…" in sidebar Settings, then
+enable "Use editor on click". Keyboard Enter continues to use the built-in preview.
+
 ## Install
 
-Requires herdr 0.8 or newer.
+Requires herdr 0.8 or newer. Source builds require Rust 1.89 or newer.
 
 ```
 herdr plugin install alexarthurs/herdr-sidebar/plugins/herdr-sidebar

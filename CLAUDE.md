@@ -103,9 +103,15 @@ executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launch
   Explorer/Source Control/Sidebar panes in every workspace, reaps only the ensure sidecar, and
   re-docks the focused workspace; preview/editor panes survive so unsaved buffers are preserved.
   The others re-dock via the focus hook the moment they're next visited.
-- Toggle-behavior settings have three platform launch paths to keep aligned: the Windows unified
-  sidecar (`ensure.rs`), the Windows separated Source Control launcher (`open-git.ps1`), and both
-  Unix launchers. Updating only the sidecar makes the same setting behave differently by view.
+- Toggle/ensure behavior has ONE implementation (`ensure.rs`). Unix actions/hooks enter it through
+  `herdr-sidebar --ensure|--toggle|--toggle-git`; Windows uses the GUI-subsystem
+  `herdr-sidebar-ensure` sidecar with the same mode flags. Do not reintroduce shell launchers whose
+  locking, liveness, or settings behavior can drift from the native path.
+- Unix opens sidebar TUIs through `plugin.pane.open`, which starts the manifest argv directly and
+  never exposes an intermediary shell prompt. Herdr 0.8.2 resolves a relative pane executable
+  against the requested cwd, not the plugin root, so omit the API `cwd`: pass the project path in
+  `HERDR_SIDEBAR_SPAWN_CWD` and let `main` change directory after process start. Windows retains the
+  raw split + PATH-injected shell launch because relative declarative pane commands do not work there.
 - **os error 5 can come from ANOTHER Windows account**: if a second account's herdr session
   runs sidebar panes from this same checkout, its processes show empty Path/StartTime in
   `Get-Process`, `Stop-Process` fails silently on them, and redeploy from this account can't
@@ -195,20 +201,24 @@ Manifest `[[events]]` hooks (undocumented in CLI help; see herdr `src/api/schema
   allowed list); the event payload arrives in the `HERDR_PLUGIN_EVENT_JSON` env var.
 - **Focus events fire in bursts** (one tab switch emits `tab.focused` AND `workspace.focused`,
   sometimes more) and hook invocations run concurrently: an unguarded ensure-pane hook opened
-  FOUR duplicate panes on one switch. Serialize hook bodies with an atomic `mkdir` lock (with a
-  stale-lock timeout) and snapshot `pane list` only after acquiring it.
+  FOUR duplicate panes on one switch. Serialize native launcher bodies with
+  `File::lock`/`try_lock` (Rust 1.89+, OS-backed and crash-released) and snapshot `pane list` only
+  after acquiring it. Focus hooks may skip a busy lock; explicit toggles and `tab.created` block
+  in the kernel so those discrete actions are not dropped. Do not poll a mkdir lock with sleeps.
 - The manifest hooks `tab.focused`, NOT `workspace.focused`: Herdr 0.8's workspace event
   carries only `workspace_id`, so a multi-tab workspace cannot identify the active tab and
   its snooze marker safely. `tab.focused` is emitted on the same switch and is unambiguous.
 - Workspace-scoped create events have no tab-level snooze to respect. Never borrow the
   globally focused tab's marker for a different workspace; an empty/legacy scope may still
   fall back to the focused tab.
-- Never hook `pane.*` events from a script that itself creates panes — feedback loop.
+- A launcher that hooks `pane.*` and also creates panes must pre-stamp identity while holding
+  the shared launcher lock; otherwise its own layout/focus events form a duplicate-pane loop.
 
-Pane environment: `HERDR_PANE_ID` is set inside every pane's shell; `HERDR_BIN_PATH` is injected
-for **actions/hooks but not panes** — fall back to `herdr` on PATH. A binary started via
-`pane run` gets no `HERDR_PLUGIN_CONTEXT_JSON`; root it from its cwd (pass `--cwd` at split).
-Our split env forwards `HERDR_PLUGIN_STATE_DIR` and prepends the binary directory to `PATH`.
+Pane environment: `HERDR_PANE_ID` is set inside every pane; `HERDR_BIN_PATH` is injected for
+**actions/hooks but not panes** — fall back to `herdr` on PATH. A binary started via terminal input
+gets no `HERDR_PLUGIN_CONTEXT_JSON`. Raw split paths root it with the split `cwd`; direct Unix
+plugin panes use `HERDR_SIDEBAR_SPAWN_CWD` for the resolution reason above. Spawn env always
+forwards `HERDR_PLUGIN_STATE_DIR` and prepends the binary directory to `PATH`.
 
 Console flashes from hooks (Windows 11, verified live):
 
@@ -412,7 +422,7 @@ HACKING.md — budget time for that before promising a patched build.
   forever. The fix: every TUI **re-stamps its identity token with the unix time** (string!)
   every ~5s; launch decisions treat a stamp older than `HEARTBEAT_STALE_SECS` (20s) — or a
   "Sidebar" label with no token at all — as a corpse and return `REPLACE <id>`: close the
-  pane, dock a fresh one. Ensure hook and all launcher scripts handle it.
+  pane, dock a fresh one. The native ensure/toggle launcher handles it.
 - **Server-restart resume creates corpses that NO event heals by itself**: herdr
   restores panes with their labels and scrollback, but the process inside is a fresh
   shell and metadata tokens are gone; restore and client attach emit NO hookable events
@@ -420,39 +430,37 @@ HACKING.md — budget time for that before promising a patched build.
   The fix is two-part: (1) label-without-token now counts as a corpse for ALL our
   labels (Sidebar/Explorer/Source Control/Preview), and (2) the ensure hook also runs
   on `pane.focused` + `tab.created` + `workspace.created`, so the user's FIRST
-  interaction after attach heals the tab. Hooking pane.* from a pane-creating script
-  is only safe because `open()` now HOLDS ITS LOCK until the spawned TUI stamps its
-  token — without that wait, queued hook invocations see the fresh label-only pane and
-  replace it before it boots: an infinite replace loop (observed live, dozens of panes
-  churned). The separated-pane launcher scripts carry the same wait.
-  Cleaner alternative (herdr-notes v0.1.1 does this): the LAUNCHER stamps the
-  identity token itself, synchronously, right after `pane.split` and BEFORE
-  `pane run` — there is then no token-less window at all, so no wait/poll is
-  needed. Worth adopting if the launchers are ever reworked.
-- A focus event may yield when the ensure lock is held because another focus event follows, but
-  `tab.created` is discrete. Unix AND the Windows sidecar must wait for the lock (the same
-  20 × 0.5 s budget as a manual toggle), or a preview tab created during the first-token wait
-  can permanently miss its sidebar (issue #32). Herdr's `EventEnvelope` serializes the JSON
-  discriminator as `tab_created`; manifest hook names remain dotted (`tab.created`).
+  interaction after attach heals the tab. Hooking `pane.*` is safe because every native launch
+  holds the shared lock until it has reported a fresh heartbeat, before swap/focus can release
+  queued hooks. A directly spawned Unix TUI also stamps `herdr-sidebar-starting` at process entry;
+  the Windows raw-split launcher stamps it before starting the command. The first full identity
+  report clears that marker. A toggle may close a still-starting pane directly because it cannot
+  contain unsaved in-memory state yet. Label-only panes remain unambiguously restored corpses.
+- A focus event may yield when the launcher lock is held because another focus event follows, but
+  `tab.created` is discrete and must block for the OS lock or a preview tab can permanently miss
+  its sidebar (issue #32). Herdr's `EventEnvelope` serializes the JSON discriminator as
+  `tab_created`; manifest hook names remain dotted (`tab.created`).
 - **Stamp the heartbeat on EVERY event-loop iteration, not only in the poll-timeout
   branch**: sustained input with <500ms gaps (held-key auto-repeat, a long paste) keeps
   `event::poll` returning true, starving a timeout-branch heartbeat until the launcher
   deems the live pane stale and REPLACE-kills it mid-edit. Same for a debounced autosave
   flush. Both self-throttle, so calling them unconditionally each iteration is free.
 - **`pane close` kills the TUI process with no chance to flush** (no signal/console-close
-  it can catch in practice) — any debounced-autosave state inside the debounce window dies
-  with it. Toggle-off launchers should first drive a graceful save+quit via
-  `pane send-keys <id> ctrl+q`, poll until the identity token disappears, THEN
-  `pane close` as cleanup. Probe errors and save failures keep the live pane open rather
-  than treating uncertainty as acknowledgement, and explicit toggles surface a notification
-  instead of failing silently. Ctrl+Q is a
-  dedicated quit chord handled before overlays/focus modes; do not use Escape, which closes
-  a tab-scoped preview/editor. SCM snapshots include commit drafts keyed by repo root, so
-  graceful quit and ordinary `q` restore unfinished text on the next Source Control pane.
+  it can catch in practice). A live-pane toggle sends Ctrl+Q and returns immediately; Ctrl+Q is
+  handled before overlays/focus modes, persists any SCM draft, and makes the TUI close its own
+  pane without writing a snooze marker; the Explorer launcher records snooze after requesting a
+  close, while user-invoked `b` / « still snooze inside either app. A save failure keeps the live
+  pane open with its error notice. The launcher directly closes only `herdr-sidebar-starting`
+  panes, which have not reached an event loop and cannot own a draft. Absorbing a separated pane
+  into unified mode uses this same graceful request, then restores the survivor's width from its
+  resize event. Do not reintroduce launcher-side acknowledgement polling. Escape remains reserved
+  for a tab-scoped preview/editor. SCM snapshots include commit drafts keyed by repo root, so
+  graceful close and ordinary `q` restore unfinished text on the next Source Control pane.
 
 ### Unified sidebar (see `src/state.rs`)
 
-- Both views ship in ONE binary: the activity bar switches them **in process** (instant,
+- Explorer, Search, and Source Control ship in ONE binary: the activity bar switches them
+  **in process** (instant,
   no flash — the terminal session is held across switches). The old two-crate host/guest
   process-swap protocol is gone.
 - User-facing wording is **"Unified sidebar: on/off"**, toggled in the ⚙ Settings modal
@@ -470,12 +478,22 @@ HACKING.md — budget time for that before promising a patched build.
   resize path; a pane-only divider resize is respected for the current layout instead of
   snapping back. The existing 15%–50% share bounds still win at extreme tab widths.
 - Every Settings action uses `state::update_state`, a lock-protected read-modify-write.
+  State/tree/SCM/root writers use persistent sibling `.lock` files with OS-backed locks; the
+  kernel releases ownership on process death, so do not poll, age, or delete those files.
   Never write an app's startup snapshot wholesale: preview tabs run independent sidebar
   processes, and a stale snapshot silently reverts newer settings from another tab.
 - Separated Explorer and Source Control panes periodically re-read shared display settings,
   including `color_theme`, `strict_toggle`, and `focus_on_open`; theme changes also update
   the process palette immediately. The Settings modal scrolls to keep its selected row visible
   when the pane is too short for all rows and hotkey hints.
+- `git_footer` (default true) keeps a one-line branch + sync strip at the bottom of Explorer,
+  Search, and Source Control whenever the root belongs to a repository. The normal
+  compact `m / ctrl+rclick for menus` hint stays dark-gray and right-aligned directly above it when
+  no notice/hotkey content exists, and the strip yields its last three cells to the « hide button.
+  The Settings row can hide it.
+  Explorer gets its branch/ahead/behind state
+  from the same one-at-a-time background status worker as decorations, but status polling stays
+  available when decorations are disabled; ignored-path scans do not.
 - `dock_right` in the same state file (default false) drives the “Dock on the right” Settings
   row. Launch target/ratio/swap, resize direction, and full-height repair all mirror from that
   one persisted choice. Preview tabs inherit it when the `tab.created` hook docks their sidebar.
@@ -499,6 +517,11 @@ HACKING.md — budget time for that before promising a patched build.
   (explorer routinely returns 1 on success), so only the SPAWN is reported. Directories are
   deliberately excluded — their association IS the file manager, which "Reveal in File
   Explorer" already covers.
+- "Reveal in File Explorer" opens a selected directory itself; only files are revealed by
+  opening their parent with the file selected. Applying file-style reveal semantics to folders
+  lands one level too high and looks like the clicked tree row was ignored. Pass the row/menu's
+  known directory bit into `actions::reveal`; restatting with `Path::is_dir()` follows symlinks
+  and can disagree with Explorer's `DirEntry::file_type()` row classification.
 - List UX invariants (both views): NOTHING is highlighted until the user selects
   (hover stays subtle); the wheel scrolls the VIEW only (`scroll_view`) and never
   moves the selection; keyboard nav snaps the view to the selection; overflow shows a
@@ -506,6 +529,10 @@ HACKING.md — budget time for that before promising a patched build.
   List AUTO-SCROLLS to keep its selection visible, which fights wheel-scrolling — both
   views therefore window their rows manually (selected/scroll/snap fields) and render
   a plain List of the visible slice.
+- A single left-click anywhere on an Explorer folder row expands/collapses it; the chevron is
+  not the only mouse target. Suppress the second click on the folder name inside the 450ms
+  double-click window so the first toggle is not immediately undone, while repeated explicit
+  chevron clicks continue to toggle each time.
 - **`m` opens the context menu from the keyboard** in BOTH views (issue #18: moshi and
   other mobile herdr clients have no right-click at all, and `pane send-keys` can't send
   one either). It routes through the same builder ctrl+right-click uses, so the menus
@@ -523,6 +550,31 @@ HACKING.md — budget time for that before promising a patched build.
   prebuilts must behave consistently on fresh machines. Build and cache the index on a worker
   polled from `App::tick`: a user-selected root can be enormous, and a synchronous walk can
   starve the heartbeat long enough for the launcher to replace a healthy pane as stale.
+- Project content search accepts both `Ctrl+F` and `Ctrl+Shift+F`: terminals that collapse the
+  shifted chord still reach the same action. It uses the bundled `ignore` walker on a worker,
+  follows the Explorer hidden-file setting, skips `.git`, binary files, and files over 1 MiB,
+  and caps both indexed files and returned matches. Results are grouped by relative file path;
+  selecting a match sends a line-bearing file request through the existing preview client.
+  Search is a persistent first-class activity view, not a popup: it updates after a 300 ms typing
+  debounce and exposes VS Code-style match-case, whole-word, and regex toggles. `1`, `2`, and `3`
+  select Explorer, Source Control, and Search. The overflow control reveals include/exclude glob
+  filters. Unfocused empty inputs render dim placeholders without mutating input state; focusing an
+  empty input hides its placeholder and puts the block caret in the first cell. The Replace field is
+  always visible without a disclosure chevron, and remains deliberately inert until replacement can
+  ship with explicit confirmation, previews, and safe failure semantics. Result line numbers use the
+  focus accent, while every visible portion of a literal/whole-word/regex match uses a bold
+  header-accent foreground. Match byte ranges come from the search matcher before display clipping
+  (including Unicode lowercase-to-source mapping); match styling must not set a background because
+  the selected-result row owns it. An untouched empty search shows no helper/status text and does
+  not reserve a blank status row; loading, errors, no-results, and result counts still render there.
+  Search's Refresh / Clear / overflow toolbar stays visible and uses the same full-size codicon,
+  three-cell chip geometry, and dim/keycap hover treatment as Explorer's title actions; do not give
+  this one surface permanent filled buttons. Material glyphs are cod-refresh EB37, cod-clear_all
+  EABF, and cod-ellipsis EA7C; text-mode fallbacks remain one-cell symbols.
+- Custom terminal editors are opt-in. The saved command is parsed into argv and launched directly,
+  never through a shell; `{file}` is substituted in arguments or appended when absent. Mouse file
+  clicks may open the command in a new herdr tab, while keyboard Enter always retains the built-in
+  preview. The saved command wins over `HERDR_SIDEBAR_EDITOR`, `VISUAL`, and `EDITOR` fallbacks.
 - **Title-bar action buttons** (`ui.rs` `TitleAction`/`title_action_spans`): VS Code-style
   hover buttons at the header's top-right (Explorer: New File / New Folder / Refresh /
   Collapse All; SCM: Refresh / Collapse All), left of the standalone ⚙. Terminals emit NO
@@ -536,6 +588,11 @@ HACKING.md — budget time for that before promising a patched build.
   single-cell**, and a trailing slack cell pushes the glyph's right edge to the chip's
   center (user-reported live); the non-Mono build just overflows into the trailing space
   like the tree's file icons do.
+- Inactive activity-bar icons and the standalone gear use a faded shade of the active selection;
+  do not reuse the smaller/subtler title-action keycap treatment. Hover extends through the same
+  three-row half-block geometry as selection, so its target never looks shorter than the selected
+  button. The active view's selection chip always wins over hover.
+  Hit zones come from each rendered glyph's actual width, so emoji and Nerd Font themes stay aligned.
 
 ### Explorer git decorations & staging (`src/gitdeco.rs`, issues #19/#20)
 
@@ -552,10 +609,18 @@ HACKING.md — budget time for that before promising a patched build.
 - Row anatomy with a marker is `[prefix][name][pad][marker][2 trailing]`: the two
   trailing cells keep the marker clear of the overflow scrollbar (which overdraws the
   last column), and the NAME ellipsizes so a narrow pane never loses the status.
-- **`--ignored` must NOT ride along on the main `-uall` status call**: with `-uall` git
+- **Ignored paths must NOT ride along on the main `-uall` status call**: with `-uall` git
   expands every file inside `target/`/`node_modules/`. `Git::ignored()` is therefore a
-  second, separate `status --porcelain --ignored=traditional --untracked-files=normal`
-  run, where ignored directories collapse to one `dir/` entry.
+  separate `ls-files --others --ignored --exclude-standard --directory` run, where wholly
+  ignored directories collapse to one `dir/` entry (including empty ignored directories). On the
+  reported 263k-file ignored tree this cut the real query from 110+s to ~75ms, but the defensive
+  path still uses `GIT_OPTIONAL_LOCKS=0`, a 5s child timeout, and a non-blocking OS file lock in
+  that worktree's git dir (temp fallback for unusual repos), shared across sidebar processes and
+  accounts. Windows attaches the child to a Job Object so timeout terminates descendants before
+  the pipe readers are released. Busy/timed-out scans preserve cached ignored roots and back off
+  for 60s; forced stage/refresh actions still update tracked status but do not bypass that ignored
+  backoff. These background reads must never hold `.git/index.lock`, strand a worker, or multiply
+  across preview tabs. The main background `status` read also disables optional locks.
 - With `-uall`, an **embedded git repo is reported by the parent as one untracked entry**
   (`?? vendor/lib/`, git never descends into it). So a nested repo root can carry BOTH an
   outer `U` and its own aggregate — `Decorations::letter` shows the louder of the two, or
@@ -608,6 +673,11 @@ HACKING.md — budget time for that before promising a patched build.
 - **Sync Changes** (`S` or the ⇅ button, shown only when ahead/behind ≠ 0): `pull --rebase
   --autostash` then `push`, on a background thread polled from tick(). Ahead/behind parse
   from the porcelain `## branch...upstream [ahead N, behind M]` header.
+- Branch labels are actions, not decoration: clicking the Source Control panel header, a
+  multi-repo header's branch label, or either view's Git footer opens the shared `BranchPicker`.
+  Local choices use a normal checkout; a remote choice creates its local tracking branch.
+  Symbolic `<remote>/HEAD` aliases are omitted. Dirty-worktree checkout failures surface intact
+  and never force, stash, discard, or otherwise mutate work to make the switch succeed.
 - Periodic Source Control status/drawer refresh backs off while its pane is unfocused, just
   like Explorer decorations. Suggestion/sync worker results are still collected first so a
   hidden pane never strands completed background work.
@@ -717,10 +787,10 @@ setting are all gone.
   only when the remembered path contains the tab's spawn cwd. Every successful manual or
   followed re-root is written to `roots.json`; a read-only `load_root` API is dead behavior.
 - The ensure hook roots a docked sidebar from **the event's own tab**
-  (`--event-scope` → `launch_decision_in` / `focused_pane_in`): during a workspace
-  switch the globally focused pane is still the space you came from. The Windows
-  ensure SIDECAR (`src/ensure.rs`) carries the same scoping — PR #15 scoped only the
-  unix `ensure-sidebar.sh`, so without this Windows kept the old cross-space bug.
+  (`event_scope_in` → `launch_decision_in` / `focused_pane_in`): during a workspace
+  switch the globally focused pane is still the space you came from. Both the Unix main-binary
+  entrypoint and Windows sidecar enter the same `ensure.rs` implementation. (Historically PR #15
+  scoped only the removed Unix shell path, leaving the Windows cross-space bug.)
   `pane.focused` has no `tab_id`, so resolve its `pane_id` through the same `pane.list`
   snapshot; a workspace scope with several tabs is ambiguous and must not pick one.
   Spawn roots prefer `foreground_cwd` but fall back to `cwd` because Windows herdr 0.8 does
@@ -780,6 +850,22 @@ setting are all gone.
   `PreviewTarget.tab_id` (that is the preview tab itself). Reusing an ephemeral preview from
   its own sidebar preserves the original origin; focus it before closing because closing the
   current tab can kill the viewer before any follow-up IPC runs.
+- Preview requests load on a worker after immediately replacing the pane with a lightweight
+  `loading preview…` document. File reads, syntax setup, `glow`, image decode, video extraction,
+  and git subprocesses must not block the viewer's event loop before it can acknowledge a click.
+  A newer control-file request replaces the receiver; a late result is applied only when its
+  request still matches the current document. Collect the receiver before drawing each frame and
+  use the 16ms `LOAD_POLL` only while a worker is active: checking it after the normal 250ms idle
+  event wait added a second polling interval, making otherwise-fast swaps take about half a second.
+- Raster image previews are decoded in-process and rendered as true-color `▀` cells (foreground
+  = upper pixel, background = lower pixel), so they work through herdr's terminal compositor
+  without Kitty/Sixel passthrough. They preserve aspect ratio, center, and rebuild from the
+  decoded source when the pane width or height changes. Common video extensions ask `ffmpeg`
+  for a bounded first-frame PNG and render it through the same path; lookup resolves an absolute
+  executable from PATH while rejecting relative/project-local entries (Windows process lookup
+  otherwise searches cwd first), and extraction has a 4s timeout plus a 16 MiB output cap.
+  Images stop at 32 MiB encoded / 12 megapixels / 64 MiB decoder allocation. Without `ffmpeg`,
+  the pane shows a capability message rather than launching an external app. Media stays read-only.
 
 ### Syntax highlighting (file preview)
 
@@ -814,6 +900,8 @@ setting are all gone.
   A copy command counts only when its exit status succeeds. Do not treat writing OSC 52 bytes
   as confirmed clipboard success: terminals provide no acknowledgement here, and unconditional
   escape output would add a behavior/security compatibility change with no opt-out.
+- ANSI parsing consumes complete OSC payloads through BEL or ST. Glow 3 emits OSC 8 hyperlinks
+  under forced color; dropping only ESC exposes the hyperlink metadata as visible preview text.
 - Edit mode accepts terminal mouse input: click moves the caret, drag selects across logical and
   wrapped rows, and Shift+click extends the current selection. Coordinates account for the line
   number gutter, tabs, wide Unicode cells, and the editor's wrapped-row scroll offset.
@@ -975,16 +1063,15 @@ First clean install of both plugins on a Mac (driven over SSH), findings:
   `nohup script -q /dev/null /bin/zsh -c 'stty rows 54 cols 220; exec herdr' &`.
   The server survives client death, restoring the session on next attach — but
   `pkill -f 'herdr$'` matches the SERVER too; workspace ids change across that restart.
-- **Unix launcher vs ensure-hook race**: `open-sidebar.sh` / `open-git.sh` originally took
-  no lock, so a user toggle racing a focus-burst ensure docked TWO sidebars (seen live).
-  They now take the SAME `herdr-sidebar-ensure.lock` mkdir lock as the hook — waiting
-  (20×0.5s) instead of yielding so the toggle isn't dropped. Post-lock terminal commands
-  must NOT `exec`: exec skips the EXIT trap and leaks the lock until the 30s stale-break.
-- **Unix ensure must hold its lock through the first TUI token stamp**: left-docking calls
-  `pane swap` and restores focus, and both operations re-emit focus events. Releasing the
-  lock immediately after `pane run` exposes a label-only pane that the corpse rule replaces,
-  creating an unbounded close/spawn loop (issue #29). Poll the new pane's identity token while
-  locked, matching the Windows ensure; do not replace this with a fixed startup sleep.
+- **Unix launcher vs ensure-hook race**: the former shell launchers could race focus-burst hooks
+  and dock two sidebars. Unix now runs the same native `ensure.rs` implementation as Windows;
+  its OS-backed file lock serializes toggles with hooks without retry sleeps or stale-lock cleanup.
+- **Stamp identity before releasing the launch lock**: left-docking calls `pane swap` and restores
+  focus, and both operations re-emit focus events. A fresh label-only pane is indistinguishable
+  from a server-restored corpse and caused the issue #29 unbounded close/spawn loop. Direct Unix
+  plugin panes start the TUI atomically and the launcher reports a heartbeat before layout/focus;
+  the Windows raw-split path stamps starting metadata before typing the command. No hook needs to
+  wait for process startup.
 - The `merged` (unified sidebar) default was still `false` from the experiment era — fresh
   installs came up as a pinned separate Explorer. Flipped to `true` (existing users keep
   their persisted value).

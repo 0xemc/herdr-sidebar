@@ -112,15 +112,16 @@ fn clean_reply(raw: &str) -> Option<String> {
             && !lower.contains("warn")
             && !lower.contains("error")
     })?;
-    let line = line.trim_matches(['"', '\'', '`']).trim_end_matches('.').trim();
+    let line = line
+        .trim_matches(['"', '\'', '`'])
+        .trim_end_matches('.')
+        .trim();
     (!line.is_empty()).then(|| line.to_string())
 }
 
 /// Filename-based fallback: good enough to save retyping, honest about scope.
 fn fallback(files: &[String]) -> String {
-    let name = |path: &String| {
-        path.rsplit('/').next().unwrap_or(path).to_string()
-    };
+    let name = |path: &String| path.rsplit('/').next().unwrap_or(path).to_string();
     match files {
         [] => "Update".to_string(),
         [only] => format!("Update {}", name(only)),
@@ -134,8 +135,14 @@ mod tests {
 
     #[test]
     fn reply_cleanup_strips_quotes_fences_and_periods() {
-        assert_eq!(clean_reply("Add sidebar merge\n"), Some("Add sidebar merge".into()));
-        assert_eq!(clean_reply("\"Fix the thing.\""), Some("Fix the thing".into()));
+        assert_eq!(
+            clean_reply("Add sidebar merge\n"),
+            Some("Add sidebar merge".into())
+        );
+        assert_eq!(
+            clean_reply("\"Fix the thing.\""),
+            Some("Fix the thing".into())
+        );
         assert_eq!(
             clean_reply("```\nRefactor launch flow\n```"),
             Some("Refactor launch flow".into())
