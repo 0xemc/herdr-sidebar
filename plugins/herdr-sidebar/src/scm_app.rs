@@ -31,8 +31,8 @@ use herdr_sidebar::state::Exit;
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::suggest;
 use herdr_sidebar::ui::{
-    TitleAction, activity_button_style, activity_icons, branch_icon, draw_activity_caps,
-    draw_scrollbar, gear_icon, hits, hits_collapse_button, hover_style,
+    TitleAction, activity_button_style, activity_icons, branch_icon, chrome_button_style,
+    draw_activity_caps, draw_scrollbar, gear_icon, hits, hits_collapse_button, hover_style,
     icon_style as ui_icon_style, keep_visible_scroll, palette, selection_style, set_color_theme,
     sibling_panes_of, sparkle_icon, status_color, title_action_spans, title_actions_visible,
     title_actions_width, truncate_to, within, wrap_footer_message, wrap_hints,
@@ -394,6 +394,13 @@ enum MenuAction {
     RemoveWorktree,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChangesHeaderAction {
+    Discard,
+    Stash,
+    Stage,
+}
+
 #[derive(Clone, Copy)]
 enum MenuEntry {
     Action(MenuAction, &'static str),
@@ -414,6 +421,9 @@ enum Overlay {
     ConfirmDiscard {
         repo: usize,
         entry: FileEntry,
+    },
+    ConfirmDiscardAll {
+        repo: usize,
     },
     /// A y/N prompt guarding a destructive git command (reset, delete, drop).
     ConfirmGit {
@@ -959,8 +969,7 @@ impl App {
         }
         if let Some((_, rx)) = &self.syncing {
             match rx.try_recv() {
-                Ok(Ok(summary)) => {
-                    self.flash = Some((summary, false));
+                Ok(Ok(_)) => {
                     self.syncing = None;
                 }
                 Ok(Err(e)) => {
@@ -1453,8 +1462,7 @@ impl App {
                     self.follow_selection();
                 }
                 Row::Commit(r) => {
-                    // Only the button line commits — not its padding rows.
-                    if line == 1 && x > 0 && x < self.last_width.saturating_sub(1) {
+                    if line <= 2 && x > 0 && x < self.last_width.saturating_sub(1) {
                         if self
                             .repos
                             .get(r)
@@ -1483,7 +1491,7 @@ impl App {
                         self.activate();
                     }
                 }
-                // Header hover −/+ unstages/stages the whole section.
+                // Header hover actions unstage/stage or manage the whole section.
                 Row::StagedHeader(r) => {
                     self.focus = Focus::List;
                     self.select(index);
@@ -1501,13 +1509,11 @@ impl App {
                 Row::ChangesHeader(r) => {
                     self.focus = Focus::List;
                     self.select(index);
-                    if x >= self.last_width.saturating_sub(6) {
-                        if let Some(repo) = self.repos.get(r)
-                            && let Err(e) = repo.git.stage_all()
-                        {
-                            self.flash = Some((e, true));
-                        }
-                        self.refresh();
+                    let count = self.repos[r].status.unstaged.len();
+                    if self.hovered == Some(index)
+                        && let Some(action) = changes_header_action_at(x, self.last_width, count)
+                    {
+                        self.run_changes_header_action(r, action);
                     } else {
                         self.activate();
                     }
@@ -1669,6 +1675,7 @@ impl App {
             ToggleSetting(usize),
             AdjustWidth(bool),
             DiscardConfirmed(usize, FileEntry),
+            DiscardAllConfirmed(usize),
             GitConfirmed(usize, Vec<String>),
             Picker(PickerAction),
         }
@@ -1720,6 +1727,10 @@ impl App {
                 }
                 _ => Cmd::Close,
             },
+            Some(Overlay::ConfirmDiscardAll { repo }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => Cmd::DiscardAllConfirmed(*repo),
+                _ => Cmd::Close,
+            },
             Some(Overlay::ConfirmGit { repo, args, .. }) => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => Cmd::GitConfirmed(*repo, args.clone()),
                 _ => Cmd::Close,
@@ -1748,6 +1759,10 @@ impl App {
                     Err(e) => self.flash = Some((e, true)),
                 }
                 self.refresh();
+            }
+            Cmd::DiscardAllConfirmed(repo) => {
+                self.overlay = None;
+                self.discard_all(repo);
             }
             Cmd::Picker(action) => self.handle_picker_action(action),
         }
@@ -2388,6 +2403,45 @@ impl App {
 
     fn confirm_git(&mut self, repo: usize, prompt: String, args: Vec<String>) {
         self.overlay = Some(Overlay::ConfirmGit { repo, prompt, args });
+    }
+
+    fn run_changes_header_action(&mut self, repo: usize, action: ChangesHeaderAction) {
+        match action {
+            ChangesHeaderAction::Discard => {
+                self.overlay = Some(Overlay::ConfirmDiscardAll { repo });
+            }
+            ChangesHeaderAction::Stash => {
+                self.run_git(repo, &["stash", "push", "--include-untracked"]);
+            }
+            ChangesHeaderAction::Stage => {
+                if let Some(repo) = self.repos.get(repo)
+                    && let Err(error) = repo.git.stage_all()
+                {
+                    self.flash = Some((error, true));
+                }
+                self.refresh();
+            }
+        }
+    }
+
+    fn discard_all(&mut self, repo: usize) {
+        let Some(repo) = self.repos.get(repo) else {
+            self.flash = Some(("repository is gone".to_string(), true));
+            return;
+        };
+        let entries = repo.status.unstaged.clone();
+        let mut errors = Vec::new();
+        for entry in &entries {
+            if let Err(error) = repo.git.discard(entry) {
+                errors.push(format!("{}: {error}", entry.path));
+            }
+        }
+        self.flash = Some(if errors.is_empty() {
+            (format!("discarded {} changes", entries.len()), false)
+        } else {
+            (errors.join("; "), true)
+        });
+        self.refresh();
     }
 
     /// Click/⏎ on a drawer line: show the commit / stash / tag / branch tip
@@ -3472,8 +3526,15 @@ impl App {
         } else {
             "✓ Commit".to_string()
         };
+        draw_activity_caps(
+            frame,
+            (inner.x, inner.x + inner.width),
+            area.y,
+            area.y + area.height.saturating_sub(1),
+            bg,
+        );
         frame.render_widget(Paragraph::new(label).centered().style(style), inner);
-        self.zones.button = inner;
+        self.zones.button = Rect::new(inner.x, area.y, inner.width, area.height);
     }
 
     /// The Sync Changes label, or `None` while there is nothing to sync
@@ -3592,13 +3653,23 @@ impl App {
                         width,
                         row_hovered.then_some('−'),
                     ),
-                    Row::ChangesHeader(r) => section_item(
-                        "Changes",
-                        self.repos[r].changes_collapsed,
-                        Some(self.repos[r].status.unstaged.len()),
-                        width,
-                        row_hovered.then_some('+'),
-                    ),
+                    Row::ChangesHeader(r) => {
+                        let count = self.repos[r].status.unstaged.len();
+                        let hovered_action = row_hovered
+                            .then(|| {
+                                mouse_pos.and_then(|(x, _)| {
+                                    changes_header_action_at(x, width as u16, count)
+                                })
+                            })
+                            .flatten();
+                        changes_header_item(
+                            self.repos[r].changes_collapsed,
+                            count,
+                            width,
+                            row_hovered,
+                            hovered_action,
+                        )
+                    }
                     Row::DrawerHeader(kind) => {
                         let mut item = section_item(
                             kind.title(),
@@ -3683,6 +3754,10 @@ impl App {
         let message: Option<(String, Color)> = match (&self.overlay, &self.flash) {
             (Some(Overlay::ConfirmDiscard { entry, .. }), _) => Some((
                 format!("Discard changes to '{}'? (y/N)", entry.path),
+                palette().deleted,
+            )),
+            (Some(Overlay::ConfirmDiscardAll { .. }), _) => Some((
+                "Discard all unstaged changes? (y/N)".to_string(),
                 palette().deleted,
             )),
             (Some(Overlay::ConfirmGit { prompt, .. }), _) => {
@@ -3917,6 +3992,38 @@ fn repo_header_action_zones(width: u16) -> ((u16, u16), (u16, u16)) {
     ((start, midpoint), (midpoint, width))
 }
 
+fn changes_header_action_zones(
+    width: u16,
+    count: usize,
+) -> Option<[(ChangesHeaderAction, (u16, u16)); 3]> {
+    const ACTION_WIDTH: u16 = 3;
+    let left_width = Span::raw(" ▾ Changes").width() as u16;
+    let badge_width = Span::raw(format!(" {count} ")).width() as u16;
+    let actions_width = ACTION_WIDTH * 3;
+    let reserved = badge_width + 1;
+    if width < left_width + 1 + actions_width + reserved {
+        return None;
+    }
+    let start = width - reserved - actions_width;
+    Some([
+        (ChangesHeaderAction::Discard, (start, start + ACTION_WIDTH)),
+        (
+            ChangesHeaderAction::Stash,
+            (start + ACTION_WIDTH, start + ACTION_WIDTH * 2),
+        ),
+        (
+            ChangesHeaderAction::Stage,
+            (start + ACTION_WIDTH * 2, start + actions_width),
+        ),
+    ])
+}
+
+fn changes_header_action_at(x: u16, width: u16, count: usize) -> Option<ChangesHeaderAction> {
+    changes_header_action_zones(width, count)?
+        .into_iter()
+        .find_map(|(action, zone)| within(x, zone).then_some(action))
+}
+
 /// Columns the inline message box's input field spans (between the left
 /// border and the ✧ button).
 fn inline_field_width(pane_width: u16) -> u16 {
@@ -4049,8 +4156,13 @@ fn commit_button_item(
     if focused {
         style = style.add_modifier(Modifier::BOLD);
     }
+    let cap_style = Style::default().fg(bg);
     ListItem::new(vec![
-        Line::default(),
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled("▄".repeat(button_width), cap_style),
+            Span::raw(" "),
+        ]),
         Line::from(vec![
             Span::raw(" "),
             Span::styled(
@@ -4060,7 +4172,11 @@ fn commit_button_item(
             Span::styled(if dropdown_width == 2 { "│∨" } else { "" }, style.dim()),
             Span::raw(" "),
         ]),
-        Line::default(),
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled("▀".repeat(button_width), cap_style),
+            Span::raw(" "),
+        ]),
     ])
 }
 
@@ -4093,6 +4209,48 @@ fn section_item(
     let mut spans = vec![left, Span::raw(" ".repeat(pad))];
     if let Some(a) = action_span {
         spans.push(a);
+    }
+    spans.push(badge);
+    spans.push(Span::raw(" "));
+    ListItem::new(Line::from(spans))
+}
+
+fn changes_header_item(
+    collapsed: bool,
+    count: usize,
+    width: usize,
+    hovered: bool,
+    hovered_action: Option<ChangesHeaderAction>,
+) -> ListItem<'static> {
+    let Some(actions) = hovered
+        .then(|| changes_header_action_zones(width as u16, count))
+        .flatten()
+    else {
+        return section_item("Changes", collapsed, Some(count), width, None);
+    };
+    let arrow = if collapsed { "▸" } else { "▾" };
+    let left = Span::styled(format!(" {arrow} Changes"), Style::default().bold());
+    let badge = Span::styled(
+        format!(" {count} "),
+        Style::default()
+            .bg(palette().button_bg)
+            .fg(palette().button_fg),
+    );
+    let actions_width = usize::from(actions[2].1.1 - actions[0].1.0);
+    let pad = width
+        .saturating_sub(left.width() + actions_width + badge.width() + 1)
+        .max(1);
+    let mut spans = vec![left, Span::raw(" ".repeat(pad))];
+    for (action, _) in actions {
+        let glyph = match action {
+            ChangesHeaderAction::Discard => "↶",
+            ChangesHeaderAction::Stash => "⇩",
+            ChangesHeaderAction::Stage => "+",
+        };
+        spans.push(Span::styled(
+            format!(" {glyph} "),
+            chrome_button_style(hovered_action == Some(action)),
+        ));
     }
     spans.push(badge);
     spans.push(Span::raw(" "));
@@ -4226,6 +4384,32 @@ mod tests {
     fn narrow_repo_headers_disable_hidden_action_zones() {
         assert_eq!(repo_header_action_zones(4), ((0, 0), (0, 0)));
         assert_eq!(repo_header_action_zones(6), ((0, 3), (3, 6)));
+    }
+
+    #[test]
+    fn changes_header_actions_are_ordered_and_hide_when_narrow() {
+        assert_eq!(changes_header_action_zones(24, 12), None);
+        assert_eq!(
+            changes_header_action_zones(30, 12),
+            Some([
+                (ChangesHeaderAction::Discard, (16, 19)),
+                (ChangesHeaderAction::Stash, (19, 22)),
+                (ChangesHeaderAction::Stage, (22, 25)),
+            ])
+        );
+        assert_eq!(
+            changes_header_action_at(16, 30, 12),
+            Some(ChangesHeaderAction::Discard)
+        );
+        assert_eq!(
+            changes_header_action_at(21, 30, 12),
+            Some(ChangesHeaderAction::Stash)
+        );
+        assert_eq!(
+            changes_header_action_at(24, 30, 12),
+            Some(ChangesHeaderAction::Stage)
+        );
+        assert_eq!(changes_header_action_at(25, 30, 12), None);
     }
 
     #[test]

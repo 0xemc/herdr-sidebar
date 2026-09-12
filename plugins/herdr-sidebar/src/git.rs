@@ -192,6 +192,13 @@ impl Git {
         if entry.letter == 'U' {
             return run_in(&self.root, &["clean", "-fd", "--", &entry.path]).map(drop);
         }
+        if let Some(original) = entry.orig.as_deref() {
+            if entry.letter == 'R' {
+                run_in(&self.root, &["checkout", "--", original])?;
+            }
+            run_in(&self.root, &["reset", "-q", "--", &entry.path])?;
+            return run_in(&self.root, &["clean", "-fd", "--", &entry.path]).map(drop);
+        }
         run_in(&self.root, &["checkout", "--", &entry.path]).map(drop)
     }
 
@@ -799,14 +806,14 @@ pub fn parse_status(raw: &str) -> Status {
         if x != ' ' {
             status.staged.push(FileEntry {
                 path: path.clone(),
-                orig: orig.clone(),
+                orig: matches!(x, 'R' | 'C').then(|| orig.clone()).flatten(),
                 letter: display_letter(x),
             });
         }
         if y != ' ' {
             status.unstaged.push(FileEntry {
                 path,
-                orig,
+                orig: matches!(y, 'R' | 'C').then_some(orig).flatten(),
                 letter: display_letter(y),
             });
         }
@@ -1170,6 +1177,16 @@ mod tests {
     }
 
     #[test]
+    fn each_status_side_only_keeps_its_own_rename_source() {
+        let s = parse_status("RM new_name.rs\0old_name.rs\0");
+        assert_eq!(
+            s.staged,
+            vec![entry("new_name.rs", 'R', Some("old_name.rs"))]
+        );
+        assert_eq!(s.unstaged, vec![entry("new_name.rs", 'M', None)]);
+    }
+
+    #[test]
     fn type_change_reads_as_modified() {
         let s = parse_status("T  link.sh\0 T other.sh\0");
         assert_eq!(s.staged, vec![entry("link.sh", 'M', None)]);
@@ -1520,6 +1537,49 @@ mod tests {
         assert!(status.unstaged.is_empty(), "both rename sides were staged");
         assert_eq!(status.staged[0].path, "src/new.rs");
         assert_eq!(status.staged[0].orig.as_deref(), Some("src/old.rs"));
+        let _ = std::fs::remove_dir_all(&git.root);
+    }
+
+    #[test]
+    fn discarding_an_unstaged_rename_restores_only_its_snapshotted_paths() {
+        let git = repo_with_head("discard-rename");
+        std::fs::create_dir_all(git.root.join("src")).unwrap();
+        std::fs::write(git.root.join("src/old.rs"), "tracked").unwrap();
+        run_in(&git.root, &["add", "-A"]).unwrap();
+        run_in(
+            &git.root,
+            &[
+                "-c",
+                "user.email=t@t.dev",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "base",
+            ],
+        )
+        .unwrap();
+        std::fs::rename(git.root.join("src/old.rs"), git.root.join("src/new.rs")).unwrap();
+        run_in(&git.root, &["add", "-N", "src/new.rs"]).unwrap();
+
+        let entry = git
+            .status()
+            .unwrap()
+            .unstaged
+            .into_iter()
+            .find(|entry| entry.orig.is_some())
+            .unwrap();
+        git.discard(&entry).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(git.root.join("src/old.rs")).unwrap(),
+            "tracked"
+        );
+        assert!(!git.root.join("src/new.rs").exists());
+        let status = git.status().unwrap();
+        assert!(status.staged.is_empty());
+        assert!(status.unstaged.is_empty());
         let _ = std::fs::remove_dir_all(&git.root);
     }
 
