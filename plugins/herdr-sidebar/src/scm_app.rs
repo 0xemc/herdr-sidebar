@@ -508,6 +508,24 @@ struct BodyGeom {
     offset: usize,
 }
 
+fn row_hit_with_heights(
+    body: BodyGeom,
+    mouse_row: u16,
+    rows: impl IntoIterator<Item = (usize, u16)>,
+) -> Option<(usize, u16)> {
+    if mouse_row < body.top || mouse_row >= body.top + body.height {
+        return None;
+    }
+    let mut y = body.top;
+    for (index, height) in rows {
+        if mouse_row < y + height {
+            return Some((index, mouse_row - y));
+        }
+        y += height;
+    }
+    None
+}
+
 /// Clickable regions of the activity bar / header / message box, from the
 /// last draw.
 #[derive(Clone, Copy, Default)]
@@ -1131,7 +1149,6 @@ impl App {
     }
 
     fn rebuild(&mut self) {
-        self.hovered = None;
         self.rows.clear();
         let multi = self.repos.len() > 1;
         for (r, repo) in self.repos.iter().enumerate() {
@@ -1172,6 +1189,7 @@ impl App {
         if self.rows.is_empty() {
             self.selected = None;
             self.scroll = 0;
+            self.hovered = None;
             return;
         }
         if let Some(sel) = self.selected {
@@ -3141,18 +3159,12 @@ impl App {
     /// The visible row at a pane-local mouse row plus the line within it
     /// (rows vary in height: message boxes and buttons span several lines).
     fn row_hit(&self, mouse_row: u16) -> Option<(usize, u16)> {
-        if mouse_row < self.body.top || mouse_row >= self.body.top + self.body.height {
-            return None;
-        }
-        let mut y = self.body.top;
-        for index in self.body.offset..self.rows.len() {
-            let h = self.row_height(self.rows[index]);
-            if mouse_row < y + h {
-                return Some((index, mouse_row - y));
-            }
-            y += h;
-        }
-        None
+        row_hit_with_heights(
+            self.body,
+            mouse_row,
+            (self.body.offset..self.rows.len())
+                .map(|index| (index, self.row_height(self.rows[index]))),
+        )
     }
 
     /// The visible row index at a pane-local mouse row, if it lands on one.
@@ -3224,31 +3236,41 @@ impl App {
                     .active_repo()
                     .is_some_and(|repo| sync_is_primary(&repo.status)),
         );
-        let action_hint = self.hovered_action_hint();
-        let footer_lines =
-            if action_hint.is_some() && self.overlay.is_none() && self.flash.is_none() {
-                Vec::new()
-            } else {
-                self.footer_lines(area.width)
-            };
         let git_footer = self.sidebar_state.show_git_footer && self.active_repo().is_some();
-        let menu_hint = git_footer && footer_lines.is_empty();
         // A breathing row above and below the icons keeps the activity bar
         // from crowding the pane border.
         let activity_height = if self.merged() { 3 } else { 0 };
-        let [activity, header, message, button, sync, list, footer] = Layout::vertical([
-            Constraint::Length(activity_height),
-            Constraint::Length(1),
-            Constraint::Length(message_height),
-            Constraint::Length(button_height),
-            Constraint::Length(sync_height),
-            Constraint::Min(0),
-            Constraint::Length(
-                (footer_lines.len() as u16 + 2 * u16::from(menu_hint) + u16::from(git_footer))
-                    .max(1),
-            ),
-        ])
-        .areas(area);
+        let layout = |footer_height| {
+            Layout::vertical([
+                Constraint::Length(activity_height),
+                Constraint::Length(1),
+                Constraint::Length(message_height),
+                Constraint::Length(button_height),
+                Constraint::Length(sync_height),
+                Constraint::Min(0),
+                Constraint::Length(footer_height),
+            ])
+            .areas(area)
+        };
+
+        let mut footer_lines = self.footer_lines(area.width);
+        let mut menu_hint = git_footer && footer_lines.is_empty();
+        let mut sections = layout(
+            (footer_lines.len() as u16 + 2 * u16::from(menu_hint) + u16::from(git_footer)).max(1),
+        );
+        self.prepare_list(sections[5]);
+        let mut action_hint = self.hovered_action_hint();
+        if action_hint.is_some() && self.overlay.is_none() && self.flash.is_none() {
+            footer_lines.clear();
+        }
+        menu_hint = git_footer && footer_lines.is_empty();
+        sections = layout(
+            (footer_lines.len() as u16 + 2 * u16::from(menu_hint) + u16::from(git_footer)).max(1),
+        );
+        self.prepare_list(sections[5]);
+        action_hint = self.hovered_action_hint();
+
+        let [activity, header, message, button, sync, list, footer] = sections;
         self.page = list.height.saturating_sub(1).max(1) as usize;
 
         if self.merged() {
@@ -3645,45 +3667,15 @@ impl App {
     fn draw_list(&mut self, frame: &mut Frame, area: Rect) {
         let width = area.width as usize;
         let theme = self.theme;
-        let hovered = self.hovered;
         let mouse_pos = self.mouse_pos;
         let active = self.active;
         let syncing_repo = self.syncing.as_ref().map(|(repo, _)| *repo);
 
-        // Clamp the scroll and (keyboard nav only) walk it forward until the
-        // selection fits — rows have variable heights.
-        let h = (area.height as usize).max(1);
-        self.scroll = self.scroll.min(self.rows.len().saturating_sub(1));
-        if self.snap {
-            if let Some(sel) = self.selected {
-                if sel < self.scroll {
-                    self.scroll = sel;
-                } else {
-                    while self.scroll < sel {
-                        let used: usize = (self.scroll..=sel)
-                            .map(|i| self.row_height(self.rows[i]) as usize)
-                            .sum();
-                        if used <= h {
-                            break;
-                        }
-                        self.scroll += 1;
-                    }
-                }
-            }
-            self.snap = false;
-        }
-        // Visible slice: everything from `scroll` until the viewport is
-        // spent (plus one partially-clipped row).
-        let mut end = self.scroll;
-        let mut used = 0usize;
-        while end < self.rows.len() && used < h {
-            used += self.row_height(self.rows[end]) as usize;
-            end += 1;
-        }
-        let visible = end - self.scroll;
-
+        let visible = self.prepare_list(area);
+        let hovered = self.hovered;
         let selected = self.selected;
         let list_focused = self.focus == Focus::List;
+
         let items: Vec<ListItem> = self
             .rows
             .iter()
@@ -3808,11 +3800,6 @@ impl App {
             .collect();
         frame.render_widget(List::new(items), area);
         draw_scrollbar(frame, area, self.rows.len(), visible, self.scroll);
-        self.body = BodyGeom {
-            top: area.y,
-            height: area.height,
-            offset: self.scroll,
-        };
 
         // Terminal cursor inside the focused INLINE message box (multi-repo).
         if self.multi() && self.focus == Focus::Message {
@@ -3835,6 +3822,49 @@ impl App {
                 }
             }
         }
+    }
+
+    fn prepare_list(&mut self, area: Rect) -> usize {
+        // Clamp the scroll and (keyboard nav only) walk it forward until the
+        // selection fits — rows have variable heights.
+        let h = (area.height as usize).max(1);
+        self.scroll = self.scroll.min(self.rows.len().saturating_sub(1));
+        if self.snap {
+            if let Some(sel) = self.selected {
+                if sel < self.scroll {
+                    self.scroll = sel;
+                } else {
+                    while self.scroll < sel {
+                        let used: usize = (self.scroll..=sel)
+                            .map(|i| self.row_height(self.rows[i]) as usize)
+                            .sum();
+                        if used <= h {
+                            break;
+                        }
+                        self.scroll += 1;
+                    }
+                }
+            }
+            self.snap = false;
+        }
+        // Visible slice: everything from `scroll` until the viewport is
+        // spent (plus one partially-clipped row).
+        let mut end = self.scroll;
+        let mut used = 0usize;
+        while end < self.rows.len() && used < h {
+            used += self.row_height(self.rows[end]) as usize;
+            end += 1;
+        }
+        let visible = end - self.scroll;
+        self.body = BodyGeom {
+            top: area.y,
+            height: area.height,
+            offset: self.scroll,
+        };
+        self.hovered = self
+            .mouse_pos
+            .and_then(|(_, mouse_row)| self.row_at(mouse_row));
+        visible
     }
 
     /// Footer content: a flash message or confirm prompt (WRAPPED — the
@@ -4587,6 +4617,30 @@ mod tests {
         assert_eq!(FileHoverAction::Discard.footer_hint(), "↶ Discard Changes");
         assert_eq!(FileHoverAction::Stage.footer_hint(), "+ Stage Changes");
         assert_eq!(FileHoverAction::Unstage.footer_hint(), "− Unstage Changes");
+    }
+
+    #[test]
+    fn stationary_hover_uses_the_latest_list_geometry() {
+        let mouse_row = 12;
+        let before = BodyGeom {
+            top: 10,
+            height: 5,
+            offset: 2,
+        };
+        assert_eq!(
+            row_hit_with_heights(before, mouse_row, [(2, 1), (3, 3), (4, 1)]),
+            Some((3, 1))
+        );
+
+        let after = BodyGeom {
+            top: 11,
+            height: 3,
+            offset: 0,
+        };
+        assert_eq!(
+            row_hit_with_heights(after, mouse_row, [(0, 1), (1, 1), (2, 1)]),
+            Some((1, 0))
+        );
     }
 
     #[test]
