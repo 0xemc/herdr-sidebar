@@ -78,7 +78,9 @@ pub enum Exit {
     /// Switch to the Search view. `focus_query` puts the caret in the search
     /// box (the Ctrl+F "find" gesture); a plain view switch passes false so the
     /// box isn't focused and 1/2/3 keep switching.
-    Search { focus_query: bool },
+    Search {
+        focus_query: bool,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
