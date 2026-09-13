@@ -1023,8 +1023,10 @@ end-to-end twice:
   `search_active=false`) or the user's live sidebar changes under them.
 - **The hero grid's live claude/codex agents persist across the headless server** between
   sessions — reuse them (don't respawn) if their banners/composer text are still correct.
-- **Deterministic capture pipeline** (one-off scratch scripts, NOT committed — the home path
-  would leak into this public repo; recreate from these steps): ctypes
+- **Deterministic capture pipeline — `tools/screenshots/shoot_capture.py`** (portable: resolves
+  the socket from `herdr session list --json`, no hardcoded paths). One tab per run:
+  `python shoot_capture.py <tab_id> <name> [--ratio R] [--motion] [--out DIR]`. It does exactly:
+  ctypes
   `EnumWindows` → pick `CASCADIA_HOSTING_WINDOW_CLASS` whose title contains `acme-app` AND whose
   rect is >200×200 (skip 0×0 ghosts of a dying window), relaunch via `attach_shoot.ps1` if none;
   `SetWindowPos` to 1848×1011; `herdr tab focus`; optional hover motion via RPC
