@@ -411,6 +411,34 @@ impl ChangesHeaderAction {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileHoverAction {
+    Open,
+    Discard,
+    Stage,
+    Unstage,
+}
+
+impl FileHoverAction {
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::Open => "↗",
+            Self::Discard => "↶",
+            Self::Stage => "+",
+            Self::Unstage => "−",
+        }
+    }
+
+    fn footer_hint(self) -> &'static str {
+        match self {
+            Self::Open => "↗ Open Changes",
+            Self::Discard => "↶ Discard Changes",
+            Self::Stage => "+ Stage Changes",
+            Self::Unstage => "− Unstage Changes",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum MenuEntry {
     Action(MenuAction, &'static str),
@@ -1426,21 +1454,27 @@ impl App {
                 .is_some_and(|(i, at)| i == index && now.duration_since(at) < DOUBLE_CLICK);
             self.last_click = Some((index, now));
             match self.rows[index] {
-                // Clicking a changed file shows its diff, like VS Code —
-                // except on the hover − / + zone, which unstages/stages it.
+                // Clicking a changed file shows its diff, like VS Code. Hover
+                // actions open, discard, stage, or unstage that exact entry.
                 Row::Staged(r, i) => {
                     self.focus = Focus::List;
                     self.select(index);
                     if let Some(entry) = self.repos[r].status.staged.get(i).cloned() {
-                        if x >= self.last_width.saturating_sub(5) {
-                            if let Err(e) = self.repos[r].git.unstage(&entry) {
-                                self.flash = Some((e, true));
+                        match (self.hovered == Some(index))
+                            .then(|| file_hover_action_at(x, self.last_width, true))
+                            .flatten()
+                        {
+                            Some(FileHoverAction::Open) => self.open_diff(r, &entry, true),
+                            Some(FileHoverAction::Unstage) => {
+                                if let Err(error) = self.repos[r].git.unstage(&entry) {
+                                    self.flash = Some((error, true));
+                                }
+                                self.refresh();
                             }
-                            self.refresh();
-                        } else if double && self.pin_if_open(index) {
-                            // pinned the first click's tab
-                        } else {
-                            self.open_diff(r, &entry, true);
+                            _ if double && self.pin_if_open(index) => {
+                                // pinned the first click's tab
+                            }
+                            _ => self.open_diff(r, &entry, true),
                         }
                     }
                 }
@@ -1448,15 +1482,24 @@ impl App {
                     self.focus = Focus::List;
                     self.select(index);
                     if let Some(entry) = self.repos[r].status.unstaged.get(i).cloned() {
-                        if x >= self.last_width.saturating_sub(5) {
-                            if let Err(e) = self.repos[r].git.stage(&entry) {
-                                self.flash = Some((e, true));
+                        match (self.hovered == Some(index))
+                            .then(|| file_hover_action_at(x, self.last_width, false))
+                            .flatten()
+                        {
+                            Some(FileHoverAction::Open) => self.open_diff(r, &entry, false),
+                            Some(FileHoverAction::Discard) => {
+                                self.overlay = Some(Overlay::ConfirmDiscard { repo: r, entry });
                             }
-                            self.refresh();
-                        } else if double && self.pin_if_open(index) {
-                            // pinned the first click's tab
-                        } else {
-                            self.open_diff(r, &entry, false);
+                            Some(FileHoverAction::Stage) => {
+                                if let Err(error) = self.repos[r].git.stage(&entry) {
+                                    self.flash = Some((error, true));
+                                }
+                                self.refresh();
+                            }
+                            _ if double && self.pin_if_open(index) => {
+                                // pinned the first click's tab
+                            }
+                            _ => self.open_diff(r, &entry, false),
                         }
                     }
                 }
@@ -3117,13 +3160,22 @@ impl App {
         self.row_hit(mouse_row).map(|(index, _)| index)
     }
 
-    fn hovered_changes_header_action(&self) -> Option<ChangesHeaderAction> {
+    fn hovered_action_hint(&self) -> Option<&'static str> {
         let index = self.hovered?;
-        let Row::ChangesHeader(repo) = *self.rows.get(index)? else {
-            return None;
-        };
         let x = self.mouse_pos?.0;
-        changes_header_action_at(x, self.last_width, self.repos[repo].status.unstaged.len())
+        match *self.rows.get(index)? {
+            Row::ChangesHeader(repo) => {
+                changes_header_action_at(x, self.last_width, self.repos[repo].status.unstaged.len())
+                    .map(ChangesHeaderAction::footer_hint)
+            }
+            Row::Staged(..) => {
+                file_hover_action_at(x, self.last_width, true).map(FileHoverAction::footer_hint)
+            }
+            Row::Unstaged(..) => {
+                file_hover_action_at(x, self.last_width, false).map(FileHoverAction::footer_hint)
+            }
+            _ => None,
+        }
     }
 
     /// The screen row where `index`'s first line is drawn, if visible.
@@ -3172,9 +3224,7 @@ impl App {
                     .active_repo()
                     .is_some_and(|repo| sync_is_primary(&repo.status)),
         );
-        let action_hint = self
-            .hovered_changes_header_action()
-            .map(ChangesHeaderAction::footer_hint);
+        let action_hint = self.hovered_action_hint();
         let footer_lines =
             if action_hint.is_some() && self.overlay.is_none() && self.flash.is_none() {
                 Vec::new()
@@ -3709,18 +3759,38 @@ impl App {
                     Row::DrawerLine(kind, i) => {
                         drawer_line(kind, &self.drawers[kind.index()].lines[i])
                     }
-                    Row::Staged(r, i) => file_item(
-                        &self.repos[r].status.staged[i],
-                        width,
-                        theme,
-                        row_hovered.then_some('−'),
-                    ),
-                    Row::Unstaged(r, i) => file_item(
-                        &self.repos[r].status.unstaged[i],
-                        width,
-                        theme,
-                        row_hovered.then_some('+'),
-                    ),
+                    Row::Staged(r, i) => {
+                        let hovered_action = row_hovered
+                            .then(|| {
+                                mouse_pos
+                                    .and_then(|(x, _)| file_hover_action_at(x, width as u16, true))
+                            })
+                            .flatten();
+                        file_item(
+                            &self.repos[r].status.staged[i],
+                            width,
+                            theme,
+                            true,
+                            row_hovered,
+                            hovered_action,
+                        )
+                    }
+                    Row::Unstaged(r, i) => {
+                        let hovered_action = row_hovered
+                            .then(|| {
+                                mouse_pos
+                                    .and_then(|(x, _)| file_hover_action_at(x, width as u16, false))
+                            })
+                            .flatten();
+                        file_item(
+                            &self.repos[r].status.unstaged[i],
+                            width,
+                            theme,
+                            false,
+                            row_hovered,
+                            hovered_action,
+                        )
+                    }
                 };
                 if selected == Some(i) {
                     let style = if list_focused {
@@ -4044,6 +4114,33 @@ fn changes_header_action_at(x: u16, width: u16, count: usize) -> Option<ChangesH
         .find_map(|(action, zone)| within(x, zone).then_some(action))
 }
 
+fn file_hover_actions(staged: bool) -> &'static [FileHoverAction] {
+    const STAGED: &[FileHoverAction] = &[FileHoverAction::Open, FileHoverAction::Unstage];
+    const UNSTAGED: &[FileHoverAction] = &[
+        FileHoverAction::Open,
+        FileHoverAction::Discard,
+        FileHoverAction::Stage,
+    ];
+    if staged { STAGED } else { UNSTAGED }
+}
+
+fn file_hover_action_start(width: u16, staged: bool) -> Option<u16> {
+    const ACTION_WIDTH: u16 = 3;
+    const MIN_FILE_CONTENT: u16 = 8;
+    let actions_width = file_hover_actions(staged).len() as u16 * ACTION_WIDTH;
+    (width >= MIN_FILE_CONTENT + actions_width + 2).then_some(width - actions_width - 2)
+}
+
+fn file_hover_action_at(x: u16, width: u16, staged: bool) -> Option<FileHoverAction> {
+    const ACTION_WIDTH: u16 = 3;
+    let start = file_hover_action_start(width, staged)?;
+    if x < start {
+        return None;
+    }
+    let index = usize::from((x - start) / ACTION_WIDTH);
+    file_hover_actions(staged).get(index).copied()
+}
+
 /// Columns the inline message box's input field spans (between the left
 /// border and the ✧ button).
 fn inline_field_width(pane_width: u16) -> u16 {
@@ -4304,7 +4401,9 @@ fn file_item(
     entry: &FileEntry,
     width: usize,
     theme: IconTheme,
-    action: Option<char>,
+    staged: bool,
+    hovered: bool,
+    hovered_action: Option<FileHoverAction>,
 ) -> ListItem<'static> {
     let (dir, name) = match entry.path.rsplit_once('/') {
         Some((dir, name)) => (Some(dir), name),
@@ -4316,16 +4415,19 @@ fn file_item(
     let mut spans = vec![
         Span::raw("   "),
         Span::styled(format!("{} ", file_icon.glyph), icon_style),
-        Span::styled(name.to_string(), Style::default().fg(color)),
     ];
-    // The hovered row shows the stage/unstage glyph beside the letter.
-    let tail = 2 + if action.is_some() { 2 } else { 0 };
+    let actions = file_hover_actions(staged);
+    let show_actions = hovered && file_hover_action_start(width as u16, staged).is_some();
+    let actions_width = usize::from(show_actions) * actions.len() * 3;
+    let tail = 2 + actions_width;
+    let prefix_width: usize = spans.iter().map(Span::width).sum();
+    let content_width = width.saturating_sub(prefix_width + tail);
+    let visible_name = truncate_to(name.to_string(), content_width);
+    spans.push(Span::styled(visible_name, Style::default().fg(color)));
     if let Some(dir) = dir {
         let sep = std::path::MAIN_SEPARATOR.to_string();
-        // The status letter must survive narrow panes: give the dimmed dir only
-        // the room left after icon + name + letter, ellipsizing like VS Code.
         let used: usize = spans.iter().map(Span::width).sum();
-        let avail = width.saturating_sub(used + 1 + tail);
+        let avail = width.saturating_sub(used + tail);
         let text = truncate_to(format!(" {}", dir.replace('/', &sep)), avail);
         if !text.is_empty() {
             spans.push(Span::styled(text, Style::default().dim()));
@@ -4333,10 +4435,15 @@ fn file_item(
     }
     let letter = Span::styled(entry.letter.to_string(), Style::default().fg(color).bold());
     let left_width: usize = spans.iter().map(Span::width).sum();
-    let pad = width.saturating_sub(left_width + tail).max(1);
+    let pad = width.saturating_sub(left_width + tail);
     spans.push(Span::raw(" ".repeat(pad)));
-    if let Some(a) = action {
-        spans.push(Span::styled(format!("{a} "), Style::default().bold()));
+    if show_actions {
+        for action in actions {
+            spans.push(Span::styled(
+                format!(" {} ", action.glyph()),
+                chrome_button_style(hovered_action == Some(*action)),
+            ));
+        }
     }
     spans.push(letter);
     spans.push(Span::raw(" "));
@@ -4443,6 +4550,43 @@ mod tests {
             ChangesHeaderAction::Stage.footer_hint(),
             "+ Stage All Changes"
         );
+    }
+
+    #[test]
+    fn file_hover_actions_match_their_rendered_columns() {
+        assert_eq!(file_hover_action_start(18, false), None);
+        assert_eq!(file_hover_action_start(30, false), Some(19));
+        assert_eq!(
+            file_hover_action_at(19, 30, false),
+            Some(FileHoverAction::Open)
+        );
+        assert_eq!(
+            file_hover_action_at(23, 30, false),
+            Some(FileHoverAction::Discard)
+        );
+        assert_eq!(
+            file_hover_action_at(27, 30, false),
+            Some(FileHoverAction::Stage)
+        );
+        assert_eq!(file_hover_action_at(28, 30, false), None);
+
+        assert_eq!(file_hover_action_start(30, true), Some(22));
+        assert_eq!(
+            file_hover_action_at(22, 30, true),
+            Some(FileHoverAction::Open)
+        );
+        assert_eq!(
+            file_hover_action_at(26, 30, true),
+            Some(FileHoverAction::Unstage)
+        );
+    }
+
+    #[test]
+    fn file_hover_actions_describe_their_footer_tooltips() {
+        assert_eq!(FileHoverAction::Open.footer_hint(), "↗ Open Changes");
+        assert_eq!(FileHoverAction::Discard.footer_hint(), "↶ Discard Changes");
+        assert_eq!(FileHoverAction::Stage.footer_hint(), "+ Stage Changes");
+        assert_eq!(FileHoverAction::Unstage.footer_hint(), "− Unstage Changes");
     }
 
     #[test]
