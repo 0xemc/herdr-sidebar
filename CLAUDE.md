@@ -557,7 +557,20 @@ HACKING.md — budget time for that before promising a patched build.
   selecting a match sends a line-bearing file request through the existing preview client.
   Search is a persistent first-class activity view, not a popup: it updates after a 300 ms typing
   debounce and exposes VS Code-style match-case, whole-word, and regex toggles. `1`, `2`, and `3`
-  select Explorer, Source Control, and Search. The overflow control reveals include/exclude glob
+  select Explorer, Search, and Source Control — the SAME left-to-right order as the activity bar
+  and VS Code (Search is `2`, Source Control is `3`). Switching INTO Search does NOT focus the
+  search box (`open_content_search(false)` → `SearchFocus::Results`): the box stays unfocused so
+  bare `1`/`2`/`3` keep switching views, and a literal digit is still searchable once you focus the
+  box. `Ctrl+F` is the "find" gesture that opens/focuses the box ready to type
+  (`open_content_search(true)`); `Tab` or a click focus it too. The focus intent crosses the
+  cross-view `Exit::Search { focus_query }` boundary (SCM `Ctrl+F` focuses, SCM `2`/`Ctrl+2`/click
+  don't; a resumed search restores unfocused). Once a text field IS focused (a search field or the
+  SCM commit box) it captures bare digits, so the switch also answers to `Ctrl+1` / `Ctrl+2` /
+  `Ctrl+3` from ANY focus in both apps — handled at the top of each `on_key` before the
+  overlay/focus dispatch, the keyboard way out of a focused search/commit field. A modal opened
+  from Search (branch picker via a footer click, or ⚙ Settings) is parked over the search overlay
+  (`suspended_search`) and restored with its query on close, instead of dropping back to the tree.
+  The overflow control reveals include/exclude glob
   filters. Unfocused empty inputs render dim placeholders without mutating input state; focusing an
   empty input hides its placeholder and puts the block caret in the first cell. The Replace field is
   always visible without a disclosure chevron, and remains deliberately inert until replacement can
@@ -939,6 +952,86 @@ The framed screenshots in `plugins/herdr-sidebar/docs/media/` are produced with 
 scripts in `tools/screenshots/` (capture → crop → frame). Full reshoot procedure, verified
 end-to-end twice:
 
+**2026-09 reshoot findings (herdr 0.9) — read before reshooting:**
+- **The elevated spaces/agents rail comes from config.** Set
+  `[theme.custom] sidebar_bg = "#202331"` in `config.toml` (native since herdr 0.8.2;
+  `panel_bg` colors herdr's tab/status chrome, `sidebar_bg` the desktop rail). It is
+  CLIENT-rendered (`client/shell/render.rs`), so the client reads it at ATTACH — after a
+  config edit just relaunch the WT client, NO server restart needed.
+- **Window width: capture at 1848×1011** (tab area ~167×48); crop is
+  `crop.ps1 <raw> <out> 8 48 1832 955`. (SUPERSEDED by 2026-09-13: the sidebar now targets
+  ~39 cols via a per-tab split ratio ≈0.25, NOT the 48-col state field — see below.)
+- **Claude agent panes must be in AUTO mode** for the hero: after `pane run <p> claude`, send
+  `pane send-keys <p> shift+tab` until the footer reads `auto mode on` (fresh claude starts on
+  "manual mode on").
+- **Capture by HWND, not title.** herdr overrides the WT `--title`, so the shoot window shows
+  `DESKTOP-…: acme-app` and COLLIDES with the real window's title. Grab the shoot window's HWND
+  (foreground right after a fresh `wt` launch, or enumerate `CASCADIA_HOSTING_WINDOW_CLASS` and
+  pick the `acme-app` one that is not the real session), then `PrintWindow` it with
+  PW_RENDERFULLCONTENT (flag 2) — works even backgrounded/occluded, unlike screen-copy. WT
+  reuses one process, so a fresh window's env/foreground is unreliable; dead clients revert to
+  the literal `herdr-shoot` title once the server stops.
+- **Server binary:** the real server runs `%LOCALAPPDATA%\Programs\Herdr\bin\herdr.exe`; `herdr`
+  on PATH is the standalone `.herdr\packages\...\0.9.0` copy (same file via junction). Either
+  serves the shoot session; the theme comes from config, not the binary.
+
+**2026-09-13 reshoot findings — read these, they save an hour:**
+- **WT is ONE process shared by every window, INCLUDING the terminal Claude Code runs in.**
+  `SetWindowPos`/`MoveWindow` resizes, `PrintWindow` grabs, and repeated `wt -w new` launches
+  block WT's UI thread and **freeze the user's own terminal** (they have to restart it, which
+  kills the shoot window mid-capture → `bad rect 0x0`). Mitigate: launch the shoot client ONCE,
+  resize ONCE, then capture every tab in that single session (see `batch_shots.py` below); never
+  re-resize per shot; warn the user their terminal may blink/freeze for the ~2 min it runs.
+- **The shoot named pipe's NAME is the full socket path.** The pipe is
+  `\\.\pipe\C:\Users\Alex\AppData\Roaming\herdr\sessions\shoot\herdr.sock` — pass
+  `herdr_rpc.py` the socket PATH (from `herdr session list` `socket_path`), NOT the file's
+  contents (that "44684:…" string is a stale marker and fails). Python on this box has no
+  `socket.AF_UNIX`; open the named pipe as a file instead (herdr_rpc.py already does).
+- **Set pane widths with `layout.set_split_ratio` over RPC, NOT `pane resize`.** `pane resize
+  --amount` is a ratio delta on the *nearest* split and mangles the nested 2×2 grid (it re-nests
+  the sidebar into a sub-split). `layout.set_split_ratio {tab_id, path:[bool], ratio}` sets ONE
+  split absolutely. **path bools: `false`=first child, `true`=second child; `[]`=root split.**
+  The response echoes the whole tree — read it to learn the structure before setting ratios.
+- **Preferred sidebar width is ~39 cols = root-split ratio ≈0.25** at 1848×1011 (154-col tab
+  area); the old 48 cols read too wide (user-corrected). For the HERO's `[[sidebar|col1]|col2]`
+  tree, a clean 2×2 with a 39-col sidebar is root `0.623`, `[false]` `0.406`, rows `0.5`.
+- **A preview tab's auto-docked sidebar IGNORES `sidebar_width`** (it docks wide) — set its
+  width via `layout.set_split_ratio` on that tab, not the state field.
+- **Kill claude's "✘ Auto-update failed · Run claude doctor" banner** by relaunching the agent
+  with `$env:DISABLE_AUTOUPDATER=1; $env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1; claude
+  --model fable --permission-mode auto`. `--permission-mode auto` gives auto mode without the
+  shift+tab dance. Exit the old claude first (Ctrl+C ×2, or `/exit`).
+- **`report-agent --state` only accepts `idle|working|blocked|unknown`** — the old shots' blue
+  "done" came from live claude at capture time and is NOT reproducible via the socket. `pane.list`
+  does not echo the reported `agent_state`, but the rail renders it — verify in the capture.
+- **Separated view (`SC | Explorer | diff`): give the Source Control pane MORE width (~44 cols)**
+  than the others so the commit message box's right border stays aligned (user-reported). Build
+  it by toggling unified off (`s` then Enter on the first Settings row → spawns Explorer+SC),
+  `pane swap` SC into the left slot, set `preview_placement:"pane"` in state.json so `o` opens
+  the diff INLINE in the same tab (avoids the cross-tab pane-move dance), then `pane swap` so the
+  order reads SC | Explorer | diff and set the two splits' ratios.
+- **`frame_all.py` writes straight into `docs/media`, which fails with OSError 22 if a PNG is
+  locked** (File Explorer / an open viewer). Frame into a temp dir then `cp -f` over the media
+  files (the lock only blocks the open/truncate, not the overwrite of a closed handle).
+- **Global `state.json` is SHARED with the user's real session.** The shoot mutates
+  `sidebar_width`, `active`, `merged`, `preview_placement`, `search_active` — ALWAYS restore them
+  after (`merged=true`, `preview_placement="tab"`, `sidebar_width=48`, `active="explorer"`,
+  `search_active=false`) or the user's live sidebar changes under them.
+- **The hero grid's live claude/codex agents persist across the headless server** between
+  sessions — reuse them (don't respawn) if their banners/composer text are still correct.
+- **Deterministic capture pipeline** (one-off scratch scripts, NOT committed — the home path
+  would leak into this public repo; recreate from these steps): ctypes
+  `EnumWindows` → pick `CASCADIA_HOSTING_WINDOW_CLASS` whose title contains `acme-app` AND whose
+  rect is >200×200 (skip 0×0 ghosts of a dying window), relaunch via `attach_shoot.ps1` if none;
+  `SetWindowPos` to 1848×1011; `herdr tab focus`; optional hover motion via RPC
+  `pane.send_input {text:"\u001b[<35;20;30M"}` into the tab's Sidebar pane at an EMPTY row (row
+  30, not a file row — else it hover-highlights a tree row); `PrintWindow(hwnd, hdc, 2)` +
+  `GetDIBits` (BGRX) → PIL; crop `(8,48,8+1832,48+955)`. One command per shot, no PowerShell
+  Win32 hand-driving.
+- **Number-key nav changed:** in the shoot how-to the SCM shot used to be `2`; Source Control is
+  now `3` (Search is `2`). Switching a fresh sidebar to a view: send the digit key, or set
+  `active` in state.json before docking.
+
 0. **Shared backdrop (shoot session)** — shots are taken in the isolated
    `herdr --session shoot` server so herdr's left chrome shows a DUMMY roster, kept
    IDENTICAL to the herdr-aa-notes repo's shots (mirrored in that repo's CLAUDE.md):
@@ -980,7 +1073,8 @@ end-to-end twice:
    and crops; `--no-motion` for modal shots. ALWAYS `tab focus` the target tab first —
    staging the other tab leaves focus there and you capture the wrong tab):
    *preview* — explorer view, expand src/api (`Down Down Enter`, `Down Enter`), select
-   routes.rs, Enter opens the preview pane. *scm* — `2`, Down×4 to routes.rs, `o` opens
+   routes.rs, Enter opens the preview pane. *scm* — `3` (Source Control; `2` is now Search),
+   Down×4 to routes.rs, `o` opens
    the diff. *separated* — `s`, Enter toggles unified off (capture, then toggle back).
    *hero* — explorer view, Esc closes the preview, split a 2×2 agent grid to the right
    (0.25 sidebar split, then 0.5, then two down-splits), `claude` + `codex --model gpt-5.5`
