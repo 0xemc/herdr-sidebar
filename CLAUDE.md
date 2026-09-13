@@ -205,9 +205,11 @@ Manifest `[[events]]` hooks (undocumented in CLI help; see herdr `src/api/schema
   `File::lock`/`try_lock` (Rust 1.89+, OS-backed and crash-released) and snapshot `pane list` only
   after acquiring it. Focus hooks may skip a busy lock; explicit toggles and `tab.created` block
   in the kernel so those discrete actions are not dropped. Do not poll a mkdir lock with sleeps.
-- The manifest hooks `tab.focused`, NOT `workspace.focused`: Herdr 0.8's workspace event
-  carries only `workspace_id`, so a multi-tab workspace cannot identify the active tab and
-  its snooze marker safely. `tab.focused` is emitted on the same switch and is unambiguous.
+- The manifest hooks both `tab.focused` and `workspace.focused`. Herdr 0.8's workspace event
+  payload carries only `workspace_id`, so the launcher must prefer the authoritative
+  `HERDR_TAB_ID` context injected by Herdr 0.9 when it matches that workspace. The workspace
+  hook heals restored sidebars after a v0.9 server restart; `tab.focused` remains the
+  unambiguous fallback for ordinary tab switches and older hosts.
 - Workspace-scoped create events have no tab-level snooze to respect. Never borrow the
   globally focused tab's marker for a different workspace; an empty/legacy scope may still
   fall back to the focused tab.
@@ -429,8 +431,8 @@ HACKING.md — budget time for that before promising a patched build.
   at all (verified live — tab.created/workspace.created/pane.focused all silent).
   The fix is two-part: (1) label-without-token now counts as a corpse for ALL our
   labels (Sidebar/Explorer/Source Control/Preview), and (2) the ensure hook also runs
-  on `pane.focused` + `tab.created` + `workspace.created`, so the user's FIRST
-  interaction after attach heals the tab. Hooking `pane.*` is safe because every native launch
+  on `pane.focused` + `workspace.focused` + `tab.created` + `workspace.created`, so the
+  user's FIRST interaction after attach heals the tab. Hooking `pane.*` is safe because every native launch
   holds the shared lock until it has reported a fresh heartbeat, before swap/focus can release
   queued hooks. A directly spawned Unix TUI also stamps `herdr-sidebar-starting` at process entry;
   the Windows raw-split launcher stamps it before starting the command. The first full identity
