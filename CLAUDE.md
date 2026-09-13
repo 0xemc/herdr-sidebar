@@ -996,7 +996,11 @@ end-to-end twice:
   area); the old 48 cols read too wide (user-corrected). For the HERO's `[[sidebar|col1]|col2]`
   tree, a clean 2×2 with a 39-col sidebar is root `0.623`, `[false]` `0.406`, rows `0.5`.
 - **A preview tab's auto-docked sidebar IGNORES `sidebar_width`** (it docks wide) — set its
-  width via `layout.set_split_ratio` on that tab, not the state field.
+  width via `layout.set_split_ratio` on that tab, not the state field. And set it **AFTER the
+  final window resize**: the sidebar re-applies its persisted column target on every resize, so
+  a ratio set before the resize gets clobbered back to ~48 cols. Verify by pixels, not cols — at
+  1848×1011 the hero and preview sidebars match when the routes.rs selection highlight is ~399px
+  wide (ratio ≈0.27 on a `[Sidebar|preview]` two-pane tab; the col count alone lied here).
 - **Kill claude's "✘ Auto-update failed · Run claude doctor" banner** by relaunching the agent
   with `$env:DISABLE_AUTOUPDATER=1; $env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1; claude
   --model fable --permission-mode auto`. `--permission-mode auto` gives auto mode without the
