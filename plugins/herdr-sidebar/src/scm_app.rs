@@ -1275,7 +1275,21 @@ impl App {
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
         {
-            return self.open_search();
+            return self.open_search(true);
+        }
+        // View switching has to reach past the commit message box, where bare
+        // 1/2/3 type into the draft — Ctrl+1/2/3 mirror VS Code's activity bar
+        // from any focus (1 Explorer, 2 Search, 3 Source Control). Bare 1/2/3
+        // still switch from the file list.
+        if let KeyCode::Char(c @ ('1' | '2' | '3')) = key.code
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            return match c {
+                '1' => self.switch_to(View::Explorer),
+                '2' => self.open_search(false),
+                _ => self.switch_to(View::SourceControl),
+            };
         }
         match self.focus {
             Focus::Message => self.on_message_key(key),
@@ -1370,8 +1384,8 @@ impl App {
             KeyCode::Char('m') => self.open_menu_for_selection(),
             KeyCode::Char('b') => self.hide(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
-            KeyCode::Char('2') => return self.switch_to(View::SourceControl),
-            KeyCode::Char('3') => return self.open_search(),
+            KeyCode::Char('2') => return self.open_search(false),
+            KeyCode::Char('3') => return self.switch_to(View::SourceControl),
             _ => {}
         }
         None
@@ -1418,7 +1432,7 @@ impl App {
                 return self.switch_to(View::Explorer);
             }
             if within(x, z.search) {
-                return self.open_search();
+                return self.open_search(false);
             }
             if within(x, z.source_control) {
                 return self.switch_to(View::SourceControl);
@@ -2825,7 +2839,7 @@ impl App {
         Some(Exit::Switch)
     }
 
-    fn open_search(&mut self) -> Option<Exit> {
+    fn open_search(&mut self, focus_query: bool) -> Option<Exit> {
         if !self.merged() {
             return None;
         }
@@ -2833,7 +2847,7 @@ impl App {
             state.active = View::Explorer;
             state.search_active = true;
         });
-        Some(Exit::Search)
+        Some(Exit::Search { focus_query })
     }
 
     /// Close the other panel's standalone pane in our tab, if one is open.
@@ -4237,6 +4251,13 @@ fn message_box_item(
     };
     let horizontal = "─".repeat(width.saturating_sub(2));
     let field = usize::from(inline_field_width(width as u16));
+    // The ✧ button owns a fixed 3-column tail; pad the glyph to that width so
+    // its rendered width can't shove the closing border off the box corners.
+    let suggest = sparkle_icon(theme);
+    let suggest_tail = format!(
+        "{suggest}{}",
+        " ".repeat(3usize.saturating_sub(Span::raw(suggest).width()))
+    );
 
     let mut lines = vec![Line::from(Span::styled(format!("┌{horizontal}┐"), border))];
     if repo.message.is_empty() && !focused {
@@ -4246,7 +4267,7 @@ fn message_box_item(
             Span::styled("│", border),
             Span::styled(placeholder, Style::default().dim().italic()),
             Span::raw(" ".repeat(pad)),
-            Span::raw(format!("{} ", sparkle_icon(theme))),
+            Span::raw(suggest_tail.clone()),
             Span::styled("│", border),
         ]));
     } else {
@@ -4256,7 +4277,7 @@ fn message_box_item(
             let pad = field.saturating_sub(Span::raw(row.as_str()).width());
             // The ✧ button owns the 3-column tail of the FIRST line only.
             let tail = if i == 0 {
-                Span::raw(format!("{} ", sparkle_icon(theme)))
+                Span::raw(suggest_tail.clone())
             } else {
                 Span::raw("   ".to_string())
             };
@@ -4273,8 +4294,7 @@ fn message_box_item(
     ListItem::new(lines)
 }
 
-/// A repo's inline ✓ Commit button with the VS Code dropdown chevron at its
-/// right end; only the active repo's button is fully lit.
+/// A repo's inline ✓ Commit button; only the active repo's button is fully lit.
 fn commit_button_item(
     status: &Status,
     syncing: bool,
@@ -4293,8 +4313,7 @@ fn commit_button_item(
         "✓ Commit".to_string()
     };
     let button_width = width.saturating_sub(2);
-    let dropdown_width = usize::from(button_width >= 2) * 2;
-    let body_width = button_width.saturating_sub(dropdown_width);
+    let body_width = button_width;
     let label = truncate_to(label, body_width);
     let label_width = Span::raw(label.as_str()).width();
     let left_pad = body_width.saturating_sub(label_width) / 2;
@@ -4316,7 +4335,6 @@ fn commit_button_item(
                 format!("{}{label}{}", " ".repeat(left_pad), " ".repeat(right_pad)),
                 style,
             ),
-            Span::styled(if dropdown_width == 2 { "│∨" } else { "" }, style.dim()),
             Span::raw(" "),
         ]),
         Line::from(vec![

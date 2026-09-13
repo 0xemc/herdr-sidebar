@@ -329,6 +329,10 @@ pub struct App {
     hovered: Option<usize>,
     body: BodyGeom,
     overlay: Option<Overlay>,
+    /// A search overlay parked under a modal (Settings / branch picker) opened
+    /// from the Search view, restored with its query when the modal closes so
+    /// the panel doesn't silently drop back to the tree.
+    suspended_search: Option<Overlay>,
     /// Transient status/error line shown in the footer until the next action.
     notice: Option<String>,
     // Merged-sidebar state.
@@ -476,6 +480,7 @@ impl App {
             hovered: None,
             body: BodyGeom::default(),
             overlay: None,
+            suspended_search: None,
             notice: None,
             sidebar_state,
             other_exe,
@@ -1007,9 +1012,45 @@ impl App {
             if let Some(Overlay::ContentSearch { focus, .. }) = self.overlay.as_mut() {
                 *focus = SearchFocus::Query;
             } else if self.overlay.is_none() {
-                self.open_content_search();
+                // Ctrl+F is the "find" gesture — open ready to type.
+                self.open_content_search(true);
             }
             return None;
+        }
+        // View switching from the keyboard, VS Code's activity-bar order:
+        // 1 Explorer, 2 Search, 3 Source Control. Ctrl+1/2/3 always switch (an
+        // editor's group-focus chord), so they work even mid-word in a focused
+        // search field. Bare 1/2/3 ALSO switch while the Search box is NOT
+        // focused (its Results list) — the state you land in when switching to
+        // Search — so the keys stay a switcher until you deliberately focus the
+        // box (Ctrl+F / Tab / click); a focused box captures digits as text so
+        // "3" is searchable. The tree's own bare 1/2/3 are handled further down.
+        if let KeyCode::Char(c @ ('1' | '2' | '3')) = key.code {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT);
+            let bare_switch = key.modifiers.is_empty() && self.search_text_unfocused();
+            if ctrl || bare_switch {
+                return match c {
+                    '1' => {
+                        // Explorer is this app's own tree: dropping the search
+                        // overlay lands on it in-process.
+                        if matches!(self.overlay, Some(Overlay::ContentSearch { .. })) {
+                            self.overlay = None;
+                            if self.merged() {
+                                self.sidebar_state = sidebar::update_state(|state| {
+                                    state.search_active = false;
+                                });
+                            }
+                        }
+                        self.switch_to(View::Explorer)
+                    }
+                    '2' => {
+                        self.open_content_search(false);
+                        None
+                    }
+                    _ => self.switch_to(View::SourceControl),
+                };
+            }
         }
         self.notice = None;
         if self.overlay.is_some() {
@@ -1051,8 +1092,8 @@ impl App {
             KeyCode::Char('m') => self.open_menu_for_selection(),
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
-            KeyCode::Char('2') => return self.switch_to(View::SourceControl),
-            KeyCode::Char('3') => self.open_content_search(),
+            KeyCode::Char('2') => self.open_content_search(false),
+            KeyCode::Char('3') => return self.switch_to(View::SourceControl),
             _ => {}
         }
         None
@@ -1077,7 +1118,7 @@ impl App {
                     return None;
                 }
                 if (zones.search.0..zones.search.1).contains(&mouse.column) {
-                    self.open_content_search();
+                    self.open_content_search(false);
                     return None;
                 }
                 if (zones.source_control.0..zones.source_control.1).contains(&mouse.column) {
@@ -1616,7 +1657,9 @@ impl App {
             Cmd::Nothing => {}
             Cmd::Close => {
                 let closing_search = matches!(self.overlay, Some(Overlay::ContentSearch { .. }));
-                self.overlay = None;
+                // A modal opened from Search resumes it; a plain search close
+                // (Esc in the search box) has nothing parked and drops to tree.
+                self.overlay = self.suspended_search.take();
                 if closing_search && self.merged() {
                     self.sidebar_state = sidebar::update_state(|state| state.search_active = false);
                 }
@@ -1752,15 +1795,24 @@ impl App {
         }
     }
 
+    /// Park a live Search overlay so a modal can open over it and be restored
+    /// on close, rather than clobbering it (which dropped the user back to the
+    /// tree). No-op when the current overlay isn't Search.
+    fn suspend_search_for_modal(&mut self) {
+        if matches!(self.overlay, Some(Overlay::ContentSearch { .. })) {
+            self.suspended_search = self.overlay.take();
+        }
+    }
+
     fn open_branch_picker(&mut self) {
         let Some(git) = self.repos.first().cloned() else {
             return;
         };
-        if matches!(self.overlay, Some(Overlay::ContentSearch { .. })) && self.merged() {
-            self.sidebar_state = sidebar::update_state(|state| state.search_active = false);
-        }
         match BranchPicker::open(git) {
-            Ok(picker) => self.overlay = Some(Overlay::BranchPicker(picker)),
+            Ok(picker) => {
+                self.suspend_search_for_modal();
+                self.overlay = Some(Overlay::BranchPicker(picker));
+            }
             Err(error) => self.notice = Some(error),
         }
     }
@@ -1768,7 +1820,8 @@ impl App {
     fn handle_picker_action(&mut self, action: PickerAction) {
         match action {
             PickerAction::None => {}
-            PickerAction::Close => self.overlay = None,
+            // Resume a Search overlay parked under the picker (else → tree).
+            PickerAction::Close => self.overlay = self.suspended_search.take(),
             PickerAction::Checkout(branch) => {
                 let Some(Overlay::BranchPicker(picker)) = self.overlay.take() else {
                     return;
@@ -1780,6 +1833,7 @@ impl App {
                     }
                     Err(error) => self.notice = Some(error),
                 }
+                self.overlay = self.suspended_search.take();
             }
         }
     }
@@ -1828,9 +1882,7 @@ impl App {
     // ---- Settings modal ----
 
     fn open_settings(&mut self) {
-        if matches!(self.overlay, Some(Overlay::ContentSearch { .. })) && self.merged() {
-            self.sidebar_state = sidebar::update_state(|state| state.search_active = false);
-        }
+        self.suspend_search_for_modal();
         self.overlay = Some(Overlay::Settings {
             selected: 0,
             rect: Rect::default(),
@@ -1924,7 +1976,27 @@ impl App {
         });
     }
 
-    pub fn open_content_search(&mut self) {
+    /// True when the search overlay is open and its focused field holds no
+    /// text (Results focus counts as empty — nothing is being typed there), so
+    /// True when the search overlay is open with NO text field focused (the
+    /// Results list), so a bare 1/2/3 is a view switch. Switching into Search
+    /// lands here; a focused input (Ctrl+F, Tab, or a click) captures digits as
+    /// text so you can search for "3".
+    fn search_text_unfocused(&self) -> bool {
+        matches!(
+            self.overlay,
+            Some(Overlay::ContentSearch {
+                focus: SearchFocus::Results,
+                ..
+            })
+        )
+    }
+
+    /// Open the Search view. `focus_query` puts the caret in the search box
+    /// ready to type (the Ctrl+F "find" gesture); switching in via 2 / the
+    /// activity bar passes `false`, so the box is not focused and bare 1/2/3
+    /// keep switching views until the user deliberately focuses it.
+    pub fn open_content_search(&mut self, focus_query: bool) {
         if matches!(self.overlay, Some(Overlay::ContentSearch { .. })) {
             return;
         }
@@ -1939,7 +2011,11 @@ impl App {
             loading: false,
             searched: false,
             details_expanded: false,
-            focus: SearchFocus::Query,
+            focus: if focus_query {
+                SearchFocus::Query
+            } else {
+                SearchFocus::Results
+            },
             options: SearchOptions::default(),
             error: None,
             dirty_since: None,
@@ -2761,7 +2837,11 @@ impl App {
         }
         let cwd_follower = std::rc::Rc::clone(&self.cwd_follower);
         *self = App::new(root, cwd_follower);
-        self.notice = Some(format!("folder: {}", self.tree.root_name()));
+        // Only confirm an explicit folder change; an automatic cwd-follow
+        // re-root must not pop an unprompted "folder: …" notice.
+        if manual {
+            self.notice = Some(format!("folder: {}", self.tree.root_name()));
+        }
     }
 
     fn confirm_prompt(&mut self) {

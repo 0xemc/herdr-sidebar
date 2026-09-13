@@ -224,10 +224,13 @@ fn main() -> std::io::Result<()> {
     let workspace_label = workspace_label();
     let spawn_cwd = std::env::current_dir()?;
     let root_key = remembered_root_key(&workspace_label, &spawn_cwd);
-    let mut search_on_open = pinned.is_none()
+    // Some(focus_query) opens the Search view on the next Explorer render;
+    // None doesn't. A resumed search restores unfocused (a switch, not a find).
+    let mut search_on_open: Option<bool> = (pinned.is_none()
         && persisted.merged
         && persisted.active == View::Explorer
-        && persisted.search_active;
+        && persisted.search_active)
+        .then_some(false);
     let result = loop {
         let exit = match view {
             View::Explorer => run_explorer(
@@ -251,9 +254,9 @@ fn main() -> std::io::Result<()> {
             Ok(Exit::Switch) => {
                 view = view.other();
             }
-            Ok(Exit::Search) => {
+            Ok(Exit::Search { focus_query }) => {
                 view = View::Explorer;
-                search_on_open = true;
+                search_on_open = Some(focus_query);
             }
             Err(e) => break Err(e),
         }
@@ -328,13 +331,13 @@ fn run_explorer(
     root_key: &str,
     legacy_workspace_label: &str,
     spawn_cwd: &std::path::Path,
-    search_on_open: bool,
+    search_on_open: Option<bool>,
 ) -> std::io::Result<Exit> {
     let root = resolve_root(root_key, legacy_workspace_label, spawn_cwd)?;
     let mut remembered_root = root.clone();
     let mut app = explorer_app::App::new(root, cwd_follower);
-    if search_on_open {
-        app.open_content_search();
+    if let Some(focus_query) = search_on_open {
+        app.open_content_search(focus_query);
     }
     loop {
         terminal.draw(|frame| app.draw(frame))?;
