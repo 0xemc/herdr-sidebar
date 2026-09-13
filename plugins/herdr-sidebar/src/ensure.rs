@@ -80,7 +80,8 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
     let scope = if toggle {
         String::new()
     } else {
-        launch::event_scope_in(&event_json, &panes)
+        let context_tab = std::env::var("HERDR_TAB_ID").unwrap_or_default();
+        launch::event_scope_with_tab_context(&event_json, &panes, &context_tab)
     };
     let tab = snooze_tab_for_scope(&panes, &scope);
     let snooze_dir = snooze::dir();

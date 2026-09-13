@@ -542,6 +542,24 @@ pub fn event_scope_in(event_json: &str, pane_list_json: &str) -> String {
         .unwrap_or_default()
 }
 
+pub fn event_scope_with_tab_context(
+    event_json: &str,
+    pane_list_json: &str,
+    context_tab: &str,
+) -> String {
+    let scope = event_scope_in(event_json, pane_list_json);
+    let context_matches = is_flag_safe(context_tab)
+        && context_tab.contains(':')
+        && (scope.is_empty()
+            || scope == context_tab
+            || (!scope.contains(':') && context_tab.starts_with(&format!("{scope}:"))));
+    if context_matches {
+        context_tab.to_string()
+    } else {
+        scope
+    }
+}
+
 /// The pane whose cwd a sidebar docked into `scope` should be rooted from:
 /// the focused pane WITHIN that scope, else any pane in it (a brand-new space
 /// may not have a focused pane yet). An empty scope keeps the old global
@@ -1028,6 +1046,19 @@ mod tests {
         );
         assert_eq!(event_scope_in(event, &panes), "w4:t2");
         assert_eq!(event_scope(event), "w4");
+    }
+
+    #[test]
+    fn workspace_focus_uses_its_active_tab_context() {
+        let event = r#"{"event":"workspace.focused","data":{"workspace_id":"w4"}}"#;
+        let panes = pane_list(
+            r#"{"pane_id":"w4:p1","tab_id":"w4:t1","workspace_id":"w4"},
+               {"pane_id":"w4:p9","tab_id":"w4:t2","workspace_id":"w4","focused":true,"foreground_cwd":"/repo/two"}"#,
+        );
+        let scope = event_scope_with_tab_context(event, &panes, "w4:t2");
+        assert_eq!(scope, "w4:t2");
+        assert_eq!(focused_pane_in(&panes, &scope), "w4:p9\t/repo/two");
+        assert_eq!(event_scope_with_tab_context(event, &panes, "w9:t1"), "w4");
     }
 
     /// The launcher handles several event kinds through one implementation, so the only

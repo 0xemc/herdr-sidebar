@@ -101,13 +101,9 @@ command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "s
 # has a sidebar at the configured dock edge (idempotent, never steals focus). A tab hooked at
 # first focus still has its single full-height pane, so the sidebar becomes a
 # full-height edge column that later splits can't shorten.
-# tab.created / workspace.created fire when a restarted server RESTORES its
-# session — the resumed tab is already focused, so no focus TRANSITION (and
-# no tab.focused) ever happens, which used to leave dead
-# resumed sidebars (label + scrollback survive a restart; the process and
-# metadata tokens do not) sitting unhealed until the user switched tabs.
-# pane.focused heals resumed corpses the moment the user interacts with the
-# restored session (client attach emits no tab/workspace events at all).
+# v0.9 lifecycle subscriptions start with live events instead of replaying
+# restored history. workspace.focused heals restored sidebar panes when the
+# user returns to a workspace; pane.focused covers interaction within it.
 # The native launcher stamps identity before any layout operation can re-enter
 # these hooks. Re-entrant focus invocations skip while its OS-backed lock is
 # held; later ones observe a live pane.
@@ -138,6 +134,16 @@ command = ["./target/release/herdr-sidebar", "--ensure"]
 
 [[events]]
 on = "workspace.created"
+platforms = ["windows"]
+command = [".\\target\\release\\herdr-sidebar-ensure.exe"]
+
+[[events]]
+on = "workspace.focused"
+platforms = ["linux", "macos"]
+command = ["./target/release/herdr-sidebar", "--ensure"]
+
+[[events]]
+on = "workspace.focused"
 platforms = ["windows"]
 command = [".\\target\\release\\herdr-sidebar-ensure.exe"]
 
