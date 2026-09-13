@@ -401,6 +401,16 @@ enum ChangesHeaderAction {
     Stage,
 }
 
+impl ChangesHeaderAction {
+    fn footer_hint(self) -> &'static str {
+        match self {
+            Self::Discard => "↶ Discard All Changes",
+            Self::Stash => "⇩ Stash Changes",
+            Self::Stage => "+ Stage All Changes",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum MenuEntry {
     Action(MenuAction, &'static str),
@@ -3107,6 +3117,15 @@ impl App {
         self.row_hit(mouse_row).map(|(index, _)| index)
     }
 
+    fn hovered_changes_header_action(&self) -> Option<ChangesHeaderAction> {
+        let index = self.hovered?;
+        let Row::ChangesHeader(repo) = *self.rows.get(index)? else {
+            return None;
+        };
+        let x = self.mouse_pos?.0;
+        changes_header_action_at(x, self.last_width, self.repos[repo].status.unstaged.len())
+    }
+
     /// The screen row where `index`'s first line is drawn, if visible.
     fn row_y(&self, index: usize) -> Option<u16> {
         let mut y = self.body.top;
@@ -3153,7 +3172,15 @@ impl App {
                     .active_repo()
                     .is_some_and(|repo| sync_is_primary(&repo.status)),
         );
-        let footer_lines = self.footer_lines(area.width);
+        let action_hint = self
+            .hovered_changes_header_action()
+            .map(ChangesHeaderAction::footer_hint);
+        let footer_lines =
+            if action_hint.is_some() && self.overlay.is_none() && self.flash.is_none() {
+                Vec::new()
+            } else {
+                self.footer_lines(area.width)
+            };
         let git_footer = self.sidebar_state.show_git_footer && self.active_repo().is_some();
         let menu_hint = git_footer && footer_lines.is_empty();
         // A breathing row above and below the icons keeps the activity bar
@@ -3195,7 +3222,7 @@ impl App {
         frame.render_widget(Paragraph::new(footer_lines), footer_content);
         if menu_hint {
             frame.render_widget(
-                Paragraph::new("m / ctrl+rclick for menus")
+                Paragraph::new(action_hint.unwrap_or("m / ctrl+rclick for menus"))
                     .style(Style::default().fg(Color::DarkGray))
                     .alignment(Alignment::Right),
                 footer_content,
@@ -3209,18 +3236,14 @@ impl App {
             footer.width,
             1,
         );
+        let [footer_status, footer_button] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(3)]).areas(last_line);
         self.zones.git_footer = FooterZones::default();
         if git_footer {
-            let status_area = Rect::new(
-                last_line.x,
-                last_line.y,
-                last_line.width.saturating_sub(3),
-                1,
-            );
             if let Some(status) = self.active_repo().map(|repo| repo.status.clone()) {
                 self.zones.git_footer = draw_git_footer(
                     frame,
-                    status_area,
+                    footer_status,
                     self.theme,
                     &status,
                     self.syncing.is_some(),
@@ -3229,15 +3252,12 @@ impl App {
             }
         } else if footer_empty {
             frame.render_widget(
-                Paragraph::new(Span::styled(
-                    " m / ctrl+rclick: menu",
-                    Style::default().dim().italic(),
-                )),
-                last_line,
+                Paragraph::new(action_hint.unwrap_or("m / ctrl+rclick for menus"))
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Right),
+                footer_status,
             );
         }
-        let [_, footer_button] =
-            Layout::horizontal([Constraint::Min(0), Constraint::Length(3)]).areas(last_line);
         frame.render_widget(
             Paragraph::new(Span::styled(
                 "«",
@@ -4410,6 +4430,19 @@ mod tests {
             Some(ChangesHeaderAction::Stage)
         );
         assert_eq!(changes_header_action_at(25, 30, 12), None);
+    }
+
+    #[test]
+    fn changes_header_actions_describe_their_footer_tooltips() {
+        assert_eq!(
+            ChangesHeaderAction::Discard.footer_hint(),
+            "↶ Discard All Changes"
+        );
+        assert_eq!(ChangesHeaderAction::Stash.footer_hint(), "⇩ Stash Changes");
+        assert_eq!(
+            ChangesHeaderAction::Stage.footer_hint(),
+            "+ Stage All Changes"
+        );
     }
 
     #[test]
