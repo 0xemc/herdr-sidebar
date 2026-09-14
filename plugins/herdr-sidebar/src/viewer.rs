@@ -110,7 +110,7 @@ fn control_from_token(token: &str) -> PathBuf {
     }
 }
 
-fn document_token(doc_key: &str) -> String {
+pub(crate) fn document_token(doc_key: &str) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in doc_key.as_bytes() {
         hash ^= u64::from(*byte);
@@ -1414,7 +1414,7 @@ fn close_own_pane(control: &Path) -> bool {
 /// call changes nothing and emits nothing. Step through another pane first
 /// in that case. Falls back to `tab.focus` for hosts older than 0.9 and for
 /// tabs whose panes cannot be listed.
-fn focus_tab_for_client(tab_id: &str, pane_id: Option<&str>) {
+pub(crate) fn focus_tab_for_client(tab_id: &str, pane_id: Option<&str>) {
     let list = ipc::call_text("pane.list", serde_json::json!({})).unwrap_or_default();
     let pane = match pane_id {
         Some(pane) if !pane.is_empty() => pane.to_string(),

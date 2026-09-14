@@ -597,7 +597,11 @@ HACKING.md — budget time for that before promising a patched build.
 - Custom terminal editors are opt-in. The saved command is parsed into argv and launched directly,
   never through a shell; `{file}` is substituted in arguments or appended when absent. Mouse file
   clicks may open the command in a new herdr tab, while keyboard Enter always retains the built-in
-  preview. The saved command wins over `HERDR_SIDEBAR_EDITOR`, `VISUAL`, and `EDITOR` fallbacks.
+  preview. Editor panes are keyed by a canonical absolute-path hash in `hs-editor-path`, scoped to
+  their workspace, and heartbeat every 5s against the common 20s stale limit; clicking that file
+  again focuses the live pane through `focus_tab_for_client` instead of launching a duplicate. The
+  token is cleared when the editor exits. The saved command wins over `HERDR_SIDEBAR_EDITOR`,
+  `VISUAL`, and `EDITOR` fallbacks.
 - **Title-bar action buttons** (`ui.rs` `TitleAction`/`title_action_spans`): VS Code-style
   hover buttons at the header's top-right (Explorer: New File / New Folder / Refresh /
   Collapse All; SCM: Refresh / Collapse All), left of the standalone ⚙. Terminals emit NO

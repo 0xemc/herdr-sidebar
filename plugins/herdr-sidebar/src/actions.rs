@@ -268,6 +268,10 @@ pub fn open_external(path: &Path) -> io::Result<()> {
 
 const EDITOR_COMMAND_ENV: &str = "HERDR_SIDEBAR_EDITOR";
 const EDITOR_FILE_ENV: &str = "HERDR_SIDEBAR_EDITOR_FILE";
+const EDITOR_FILE_TOKEN_ENV: &str = "HERDR_SIDEBAR_EDITOR_FILE_TOKEN";
+const EDITOR_METADATA_SOURCE: &str = "herdr-sidebar-editor";
+const EDITOR_PATH_TOKEN: &str = "hs-editor-path";
+const EDITOR_HEARTBEAT_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub fn configured_editor() -> Option<String> {
     crate::state::load_editor_command().or_else(|| {
@@ -370,9 +374,33 @@ pub fn run_configured_editor() -> io::Result<()> {
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "editor file is missing"))?;
     let argv = editor_argv(&command, &file)?;
+    let pane_id = std::env::var("HERDR_PANE_ID").unwrap_or_default();
+    let file_token = std::env::var(EDITOR_FILE_TOKEN_ENV).unwrap_or_default();
+    let heartbeat = if pane_id.is_empty() || file_token.is_empty() {
+        None
+    } else {
+        let _ = report_editor_identity(&pane_id, Some(&file_token));
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let heartbeat_pane = pane_id.clone();
+        let heartbeat_token = file_token.clone();
+        let handle = std::thread::spawn(move || {
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                stop_rx.recv_timeout(EDITOR_HEARTBEAT_EVERY)
+            {
+                let _ = report_editor_identity(&heartbeat_pane, Some(&heartbeat_token));
+            }
+        });
+        Some((stop_tx, handle))
+    };
     let status = std::process::Command::new(&argv[0])
         .args(&argv[1..])
-        .status()?;
+        .status();
+    if let Some((stop_tx, handle)) = heartbeat {
+        let _ = stop_tx.send(());
+        let _ = handle.join();
+        let _ = report_editor_identity(&pane_id, None);
+    }
+    let status = status?;
     if status.success() {
         Ok(())
     } else {
@@ -398,6 +426,18 @@ pub fn open_in_editor_tab(my_pane_id: &str, root: &Path, file: &Path) -> io::Res
             "could not find the current workspace",
         ));
     }
+    let editor_file = if file.is_absolute() {
+        file.to_path_buf()
+    } else {
+        root.join(file)
+    };
+    let file_token = editor_file_token(&editor_file);
+    if let Some((tab_id, pane_id)) =
+        editor_tab_for_file(&panes, &workspace_id, &file_token, crate::state::unix_now())
+    {
+        crate::viewer::focus_tab_for_client(&tab_id, Some(&pane_id));
+        return Ok(());
+    }
     let mut env = crate::state::spawn_env()
         .as_object()
         .cloned()
@@ -408,7 +448,11 @@ pub fn open_in_editor_tab(my_pane_id: &str, root: &Path, file: &Path) -> io::Res
     );
     env.insert(
         EDITOR_FILE_ENV.into(),
-        serde_json::Value::String(file.display().to_string()),
+        serde_json::Value::String(editor_file.display().to_string()),
+    );
+    env.insert(
+        EDITOR_FILE_TOKEN_ENV.into(),
+        serde_json::Value::String(file_token.clone()),
     );
     let label = file
         .file_name()
@@ -420,7 +464,7 @@ pub fn open_in_editor_tab(my_pane_id: &str, root: &Path, file: &Path) -> io::Res
             "workspace_id": workspace_id,
             "label": format!("{label} · editor"),
             "cwd": root.display().to_string(),
-            "focus": true,
+            "focus": false,
             "env": env,
         }),
     )?;
@@ -430,6 +474,10 @@ pub fn open_in_editor_tab(my_pane_id: &str, root: &Path, file: &Path) -> io::Res
             "editor tab opened without pane metadata",
         )
     })?;
+    if let Err(error) = report_editor_identity(&pane_id, Some(&file_token)) {
+        let _ = crate::ipc::call_text("tab.close", serde_json::json!({ "tab_id": tab_id }));
+        return Err(error);
+    }
     if let Err(error) = crate::ipc::call_text(
         "pane.send_input",
         serde_json::json!({
@@ -441,6 +489,75 @@ pub fn open_in_editor_tab(my_pane_id: &str, root: &Path, file: &Path) -> io::Res
         let _ = crate::ipc::call_text("tab.close", serde_json::json!({ "tab_id": tab_id }));
         return Err(error);
     }
+    crate::viewer::focus_tab_for_client(&tab_id, Some(&pane_id));
+    Ok(())
+}
+
+fn editor_file_token(file: &Path) -> String {
+    let path = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    let key = path.display().to_string();
+    #[cfg(windows)]
+    let key = key.replace('/', "\\").to_lowercase();
+    crate::viewer::document_token(&key)
+}
+
+fn editor_tab_for_file(
+    panes_json: &str,
+    workspace_id: &str,
+    file_token: &str,
+    now: u64,
+) -> Option<(String, String)> {
+    #[derive(serde::Deserialize)]
+    struct Msg {
+        result: Res,
+    }
+    #[derive(serde::Deserialize)]
+    struct Res {
+        #[serde(default)]
+        panes: Vec<Pane>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Pane {
+        pane_id: Option<String>,
+        tab_id: Option<String>,
+        workspace_id: Option<String>,
+        #[serde(default)]
+        tokens: std::collections::BTreeMap<String, serde_json::Value>,
+    }
+
+    let msg = serde_json::from_str::<Msg>(crate::launch::strip_bom(panes_json)).ok()?;
+    msg.result.panes.into_iter().find_map(|pane| {
+        if pane.workspace_id.as_deref() != Some(workspace_id)
+            || pane.tokens.get(EDITOR_PATH_TOKEN)?.as_str()? != file_token
+        {
+            return None;
+        }
+        let heartbeat = pane
+            .tokens
+            .get(EDITOR_METADATA_SOURCE)?
+            .as_str()?
+            .parse::<u64>()
+            .ok()?;
+        if now.saturating_sub(heartbeat) > crate::launch::HEARTBEAT_STALE_SECS {
+            return None;
+        }
+        Some((pane.tab_id?, pane.pane_id?))
+    })
+}
+
+fn report_editor_identity(pane_id: &str, file_token: Option<&str>) -> io::Result<()> {
+    let heartbeat = file_token.map(|_| crate::state::unix_now().to_string());
+    crate::ipc::call_text(
+        "pane.report_metadata",
+        serde_json::json!({
+            "pane_id": pane_id,
+            "source": EDITOR_METADATA_SOURCE,
+            "tokens": {
+                EDITOR_METADATA_SOURCE: heartbeat,
+                EDITOR_PATH_TOKEN: file_token,
+            },
+        }),
+    )?;
     Ok(())
 }
 
@@ -646,6 +763,54 @@ mod tests {
             Some(("w1:t9".into(), "w1:p8".into()))
         );
         assert_eq!(tab_create_ids("garbage"), None);
+    }
+
+    #[test]
+    fn editor_tabs_reuse_only_the_live_matching_path_in_the_same_workspace() {
+        let first = editor_file_token(Path::new("/one/README.md"));
+        let second = editor_file_token(Path::new("/two/README.md"));
+        assert_ne!(first, second, "same-named files keep distinct identities");
+        let panes = serde_json::json!({
+            "result": { "panes": [
+                {
+                    "pane_id": "w1:p1",
+                    "tab_id": "w1:t1",
+                    "workspace_id": "w1",
+                    "tokens": {
+                        EDITOR_METADATA_SOURCE: "100",
+                        EDITOR_PATH_TOKEN: first,
+                    }
+                },
+                {
+                    "pane_id": "w2:p1",
+                    "tab_id": "w2:t1",
+                    "workspace_id": "w2",
+                    "tokens": {
+                        EDITOR_METADATA_SOURCE: "100",
+                        EDITOR_PATH_TOKEN: first,
+                    }
+                },
+                {
+                    "pane_id": "w1:p2",
+                    "tab_id": "w1:t2",
+                    "workspace_id": "w1",
+                    "tokens": {
+                        EDITOR_METADATA_SOURCE: "1",
+                        EDITOR_PATH_TOKEN: second,
+                    }
+                }
+            ] }
+        })
+        .to_string();
+        assert_eq!(
+            editor_tab_for_file(&panes, "w1", &first, 100),
+            Some(("w1:t1".into(), "w1:p1".into()))
+        );
+        assert_eq!(editor_tab_for_file(&panes, "w1", &second, 100), None);
+        assert_eq!(
+            editor_tab_for_file(&panes, "w2", &first, 100),
+            Some(("w2:t1".into(), "w2:p1".into()))
+        );
     }
 
     #[test]

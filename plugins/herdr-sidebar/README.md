@@ -17,7 +17,8 @@ from Settings.
 Common image formats render directly in the preview pane; videos show a poster frame when
 `ffmpeg` is available on `PATH`.
 To open clicked files in a terminal editor, configure "Custom editor…" in sidebar Settings, then
-enable "Use editor on click". Keyboard Enter continues to use the built-in preview.
+enable "Use editor on click". Clicking an already-open file focuses its existing editor tab;
+keyboard Enter continues to use the built-in preview.
 
 ## Install
 

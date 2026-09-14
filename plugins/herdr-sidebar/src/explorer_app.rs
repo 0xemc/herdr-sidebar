@@ -27,7 +27,7 @@ use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::tree::{Row, Tree};
 use herdr_sidebar::ui::{
     TitleAction, activity_button_style, activity_icons, chrome_button_style, draw_activity_caps,
-    draw_scrollbar, gear_icon, hits, hits_collapse_button, hover_style,
+    draw_scrollbar, gear_icon, hits, hits_activity_button, hits_collapse_button, hover_style,
     icon_style as ui_icon_style, input_tail, keep_visible_scroll, palette, selection_style,
     set_color_theme, sibling_panes_of, status_color, title_action_icon, title_action_spans,
     title_actions_visible, title_actions_width, truncate_to, wrap_footer_message, wrap_hints,
@@ -1150,17 +1150,17 @@ impl App {
         }
         if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
             let zones = self.activity;
-            if self.merged() && mouse.row == zones.row {
-                if (zones.explorer.0..zones.explorer.1).contains(&mouse.column) {
+            if self.merged() {
+                if hits_activity_button(zones.explorer, zones.row, mouse.column, mouse.row) {
                     self.overlay = None;
                     self.sidebar_state = sidebar::update_state(|state| state.search_active = false);
                     return None;
                 }
-                if (zones.search.0..zones.search.1).contains(&mouse.column) {
+                if hits_activity_button(zones.search, zones.row, mouse.column, mouse.row) {
                     self.open_content_search(false);
                     return None;
                 }
-                if (zones.source_control.0..zones.source_control.1).contains(&mouse.column) {
+                if hits_activity_button(zones.source_control, zones.row, mouse.column, mouse.row) {
                     return self.switch_to(View::SourceControl);
                 }
             }
@@ -1214,7 +1214,10 @@ impl App {
                     self.hide();
                     return None;
                 }
-                let index = self.row_at(mouse.row)?;
+                let Some(index) = self.row_at(mouse.row) else {
+                    self.clear_selection();
+                    return None;
+                };
                 self.select(index);
                 let row = &self.rows[index];
                 let (is_dir, path) = (row.is_dir, row.path.clone());
@@ -2981,6 +2984,14 @@ impl App {
         }
     }
 
+    fn clear_selection(&mut self) {
+        if self.selected.take().is_some() {
+            self.hovered = None;
+            self.last_click = None;
+            self.persist_tree();
+        }
+    }
+
     /// Publish this root's tree shape and selection. Other same-root sidebars
     /// adopt it during their next idle tick.
     fn persist_tree(&self) {
@@ -3473,10 +3484,9 @@ impl App {
             search: bounds[3],
             source_control: bounds[5],
         };
-        let hovered = |(start, end): (u16, u16)| {
-            self.mouse_pos.is_some_and(|(x, y)| {
-                (outer_top..=outer_bottom).contains(&y) && (start..end).contains(&x)
-            })
+        let hovered = |bounds| {
+            self.mouse_pos
+                .is_some_and(|(x, y)| hits_activity_button(bounds, area.y, x, y))
         };
         let explorer_hovered = hovered(bounds[1]);
         let search_hovered = hovered(bounds[3]);
@@ -3510,10 +3520,8 @@ impl App {
         let gear_text = format!(" {} ", gear_icon(self.theme));
         let gear_w = Span::raw(gear_text.as_str()).width() as u16;
         let gear_x = area.x + area.width.saturating_sub(gear_w);
-        self.gear = Rect::new(gear_x, area.y, gear_w, 1);
-        let gear_hovered = self.mouse_pos.is_some_and(|(x, y)| {
-            (gear_x..gear_x + gear_w).contains(&x) && (outer_top..=outer_bottom).contains(&y)
-        });
+        self.gear = Rect::new(gear_x, outer_top, gear_w, 3);
+        let gear_hovered = self.mouse_pos.is_some_and(|(x, y)| hits(self.gear, x, y));
         let gear = Span::styled(gear_text, activity_button_style(false, gear_hovered));
         if gear_hovered {
             draw_activity_caps(
