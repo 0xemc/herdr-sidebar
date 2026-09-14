@@ -554,10 +554,12 @@ HACKING.md — budget time for that before promising a patched build.
   starve the heartbeat long enough for the launcher to replace a healthy pane as stale.
 - Host-remappable activity actions (`show-explorer`, `show-search`, `show-git`, and
   `quick-open`, each with a Windows-suffixed twin) route through native `ensure::Mode::Activate`.
-  They never toggle closed: an existing pane receives the stable internal Ctrl chord, while a
-  fresh pane receives `HERDR_SIDEBAR_INITIAL_ACTIVITY` so it starts on the exact requested view
-  without racing terminal input against its shell/TUI startup. This is also how a host `cmd+p`
-  binding opens Quick Open without pretending terminals can portably report the Command key.
+  They never toggle closed: an existing pane receives an F9–F12 transport key that the PTY decoder
+  emits reliably, while a fresh pane receives `HERDR_SIDEBAR_INITIAL_ACTIVITY` so it starts on the
+  exact requested view without racing terminal input against its shell/TUI startup. Do not use
+  synthetic Ctrl+number here: legacy terminal encoding turns Ctrl+3 into Escape. This is also how
+  a host `cmd+p` binding opens Quick Open without pretending terminals can portably report the
+  Command key.
 - Project content search accepts both `Ctrl+F` and `Ctrl+Shift+F`: terminals that collapse the
   shifted chord still reach the same action. It uses the bundled `ignore` walker on a worker,
   follows the Explorer hidden-file setting, skips `.git`, binary files, and files over 1 MiB,

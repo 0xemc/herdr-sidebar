@@ -63,10 +63,10 @@ impl Target {
 
     fn key(self) -> &'static str {
         match self {
-            Self::Explorer => "ctrl+1",
-            Self::Search => "ctrl+2",
-            Self::SourceControl => "ctrl+3",
-            Self::QuickOpen => "ctrl+p",
+            Self::Explorer => "f9",
+            Self::Search => "f10",
+            Self::SourceControl => "f11",
+            Self::QuickOpen => "f12",
         }
     }
 }
@@ -506,10 +506,10 @@ mod tests {
     #[test]
     fn direct_activities_use_the_unified_pane_and_stable_keys() {
         for (target, value, key) in [
-            (Target::Explorer, "explorer", "ctrl+1"),
-            (Target::Search, "search", "ctrl+2"),
-            (Target::SourceControl, "source-control", "ctrl+3"),
-            (Target::QuickOpen, "quick-open", "ctrl+p"),
+            (Target::Explorer, "explorer", "f9"),
+            (Target::Search, "search", "f10"),
+            (Target::SourceControl, "source-control", "f11"),
+            (Target::QuickOpen, "quick-open", "f12"),
         ] {
             assert_eq!(Target::from_env_value(value), Some(target));
             assert_eq!(target.env_value(), value);

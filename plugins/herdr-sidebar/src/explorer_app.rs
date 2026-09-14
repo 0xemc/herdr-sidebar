@@ -1021,9 +1021,10 @@ impl App {
             self.close(false);
             return None;
         }
-        if key.code == KeyCode::Char('p')
+        if (key.code == KeyCode::Char('p')
             && key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT)
+            && !key.modifiers.contains(KeyModifiers::ALT))
+            || key.code == KeyCode::F(12)
         {
             self.suspended_search = None;
             self.open_quick_open();
@@ -1049,9 +1050,19 @@ impl App {
         // Search — so the keys stay a switcher until you deliberately focus the
         // box (Ctrl+F / Tab / click); a focused box captures digits as text so
         // "3" is searchable. The tree's own bare 1/2/3 are handled further down.
-        if let KeyCode::Char(c @ ('1' | '2' | '3')) = key.code {
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT);
+        let injected_view = match key.code {
+            KeyCode::F(9) => Some('1'),
+            KeyCode::F(10) => Some('2'),
+            KeyCode::F(11) => Some('3'),
+            _ => None,
+        };
+        if let Some(c) = injected_view.or(match key.code {
+            KeyCode::Char(c @ ('1' | '2' | '3')) => Some(c),
+            _ => None,
+        }) {
+            let ctrl = injected_view.is_some()
+                || (key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT));
             let bare_switch = key.modifiers.is_empty() && self.search_text_unfocused();
             if ctrl || bare_switch {
                 if ctrl {

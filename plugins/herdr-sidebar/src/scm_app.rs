@@ -1267,9 +1267,10 @@ impl App {
             return None;
         }
         self.flash = None;
-        if key.code == KeyCode::Char('p')
+        if ((key.code == KeyCode::Char('p')
             && key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT)
+            && !key.modifiers.contains(KeyModifiers::ALT))
+            || key.code == KeyCode::F(12))
             && self.merged()
         {
             self.sidebar_state = sidebar::update_state(|state| {
@@ -1282,10 +1283,22 @@ impl App {
         // 1/2/3 type into the draft — Ctrl+1/2/3 mirror VS Code's activity bar
         // from any focus (1 Explorer, 2 Search, 3 Source Control). Bare 1/2/3
         // still switch from the file list.
-        if let KeyCode::Char(c @ ('1' | '2' | '3')) = key.code
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT)
-        {
+        let injected_view = match key.code {
+            KeyCode::F(9) => Some('1'),
+            KeyCode::F(10) => Some('2'),
+            KeyCode::F(11) => Some('3'),
+            _ => None,
+        };
+        let keyboard_view = match key.code {
+            KeyCode::Char(c @ ('1' | '2' | '3'))
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                Some(c)
+            }
+            _ => None,
+        };
+        if let Some(c) = injected_view.or(keyboard_view) {
             self.overlay = None;
             return match c {
                 '1' => self.switch_to(View::Explorer),
