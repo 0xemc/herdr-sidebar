@@ -1267,15 +1267,16 @@ impl App {
             return None;
         }
         self.flash = None;
-        if self.overlay.is_some() {
-            self.overlay_key(key);
-            return None;
-        }
-        if matches!(key.code, KeyCode::Char('f' | 'F'))
+        if key.code == KeyCode::Char('p')
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
+            && self.merged()
         {
-            return self.open_search(true);
+            self.sidebar_state = sidebar::update_state(|state| {
+                state.active = View::Explorer;
+                state.search_active = false;
+            });
+            return Some(Exit::QuickOpen);
         }
         // View switching has to reach past the commit message box, where bare
         // 1/2/3 type into the draft — Ctrl+1/2/3 mirror VS Code's activity bar
@@ -1285,11 +1286,22 @@ impl App {
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
         {
+            self.overlay = None;
             return match c {
                 '1' => self.switch_to(View::Explorer),
                 '2' => self.open_search(false),
                 _ => self.switch_to(View::SourceControl),
             };
+        }
+        if self.overlay.is_some() {
+            self.overlay_key(key);
+            return None;
+        }
+        if matches!(key.code, KeyCode::Char('f' | 'F'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            return self.open_search(true);
         }
         match self.focus {
             Focus::Message => self.on_message_key(key),
@@ -2886,7 +2898,7 @@ impl App {
         );
         let other = MY_VIEW.other();
         #[cfg(unix)]
-        let _ = herdr_sidebar::ipc::open_plugin_pane(&ctl.pane_id, other, &self.cwd, false);
+        let _ = herdr_sidebar::ipc::open_plugin_pane(&ctl.pane_id, other, &self.cwd, false, None);
         #[cfg(windows)]
         {
             let response = herdr_sidebar::ipc::call_text(
@@ -3937,7 +3949,7 @@ impl App {
             ("q", "quit"),
         ];
         if self.merged() {
-            hints.extend([("1", "files"), ("2", "git")]);
+            hints.extend([("1", "files"), ("2", "search"), ("3", "git")]);
         }
         hints
     }

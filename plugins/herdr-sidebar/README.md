@@ -10,6 +10,8 @@ keys, and settings.
 
 Quick Open is `Ctrl+P`; project text search has its own activity view and opens with `Ctrl+F`
 or `Ctrl+Shift+F`. It searches live with match-case, whole-word, regex, and include/exclude filters.
+Herdr keybindings can invoke `show-explorer`, `show-search`, `show-git`, or `quick-open`
+directly (`-windows` suffix on Windows), so chords such as `Cmd+P` are remappable by the host.
 The Git footer keeps branch switching and sync one click away in every view and can be hidden
 from Settings.
 Common image formats render directly in the preview pane; videos show a poster frame when

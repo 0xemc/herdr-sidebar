@@ -61,6 +61,10 @@ pub const PREVIEW_CONTROL_ENV: &str = "HERDR_SIDEBAR_PREVIEW_CONTROL";
 /// re-read from the settings file, which the user can flip mid-life.
 pub const PREVIEW_INLINE_ENV: &str = "HERDR_SIDEBAR_PREVIEW_INLINE";
 
+/// One-shot activity requested by a host-level action while opening a fresh
+/// sidebar pane.
+pub const INITIAL_ACTIVITY_ENV: &str = "HERDR_SIDEBAR_INITIAL_ACTIVITY";
+
 /// Unix seconds now — the heartbeat clock for pane identity tokens.
 pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -81,6 +85,8 @@ pub enum Exit {
     Search {
         focus_query: bool,
     },
+    /// Switch to Explorer and open its Quick Open picker.
+    QuickOpen,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -535,8 +541,8 @@ impl StateWriteLock {
 /// `state.json` rather than in [`State`], which stays `Copy` because it is
 /// passed by value everywhere.
 ///
-/// Captured at sidebar startup only — expanding a folder in one tab does not
-/// reach into tabs that are already open.
+/// Running sidebars periodically adopt the latest state for their root, so
+/// tabs looking at the same project stay aligned.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct TreeState {
     pub expanded: Vec<PathBuf>,
@@ -592,9 +598,15 @@ fn tree_state_for(file: &TreeFile, root: &Path) -> TreeState {
     }
 }
 
-/// The tree state saved for `root`, for a sidebar starting up in it.
+/// The latest shared tree state saved for `root`.
 pub fn load_tree_state(root: &Path) -> TreeState {
-    let Some(json) = tree_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
+    let Some(path) = tree_path() else {
+        return TreeState::default();
+    };
+    let Some(_lock) = StateWriteLock::acquire(&path) else {
+        return TreeState::default();
+    };
+    let Some(json) = std::fs::read_to_string(path).ok() else {
         return TreeState::default();
     };
     tree_state_for(&decode_tree_file(&json), root)
@@ -611,8 +623,8 @@ pub fn save_tree_state(root: &Path, state: &TreeState) {
         return;
     };
     // Read-modify-write: concurrent sidebars in DIFFERENT roots must not
-    // erase each other's entries. Two sidebars in the SAME root race, and
-    // last-writer-wins is fine — they hold the same tree.
+    // erase each other's entries. Same-root sidebars converge on the last
+    // complete write during their next idle tick.
     let mut file = std::fs::read_to_string(&path)
         .map(|json| decode_tree_file(&json))
         .unwrap_or_default();

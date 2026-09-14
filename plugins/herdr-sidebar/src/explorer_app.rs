@@ -42,6 +42,7 @@ const MY_VIEW: View = View::Explorer;
 /// explorer's own poll is 500ms, so this throttles them down to a quarter of
 /// that.
 const DECO_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
+const TREE_SYNC_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
 
 struct RepoDecorationRefresh {
     root: PathBuf,
@@ -371,6 +372,9 @@ pub struct App {
     deco: Decorations,
     /// Last decoration refresh, throttling the git polling.
     last_deco: std::time::Instant,
+    /// Last shared tree-state read. Input bursts may call `tick` rapidly;
+    /// synchronization should not turn every keypress into disk I/O.
+    last_tree_sync: std::time::Instant,
     /// One background decoration refresh. Keeping at most one receiver avoids
     /// multiplying git processes when a slow repository overlaps the timer.
     deco_rx: Option<std::sync::mpsc::Receiver<DecorationRefresh>>,
@@ -438,9 +442,8 @@ impl App {
         cwd_follower: std::rc::Rc<std::cell::RefCell<herdr_sidebar::launch::CwdFollower>>,
     ) -> Self {
         let mut tree = Tree::new(root);
-        // Mirror the tree the user was already looking at: a sidebar docked
-        // into a brand-new preview tab starts with the same dirs expanded
-        // and the same row selected.
+        // Mirror the tree the user was already looking at. Idle ticks keep
+        // same-root sidebars synchronized after startup too.
         let saved = sidebar::load_tree_state(&tree.root_path());
         tree.set_expanded(saved.expanded);
         let rows = tree.rows();
@@ -498,6 +501,7 @@ impl App {
             deco: Decorations::empty(),
             // Overwritten when the first background refresh is queued below.
             last_deco: std::time::Instant::now(),
+            last_tree_sync: std::time::Instant::now(),
             deco_rx: None,
             git_footer_status: None,
             git_footer_zones: FooterZones::default(),
@@ -527,6 +531,7 @@ impl App {
     /// on their own. Self-throttling, so the event loop may call it freely.
     pub fn tick(&mut self) {
         self.sync_shared_settings();
+        self.sync_shared_tree();
         self.collect_quick_index();
         self.collect_content_search();
         self.collect_git_sync();
@@ -573,6 +578,24 @@ impl App {
             self.deco = Decorations::empty();
         }
         self.request_decorations(true);
+    }
+
+    fn sync_shared_tree(&mut self) {
+        if self.last_tree_sync.elapsed() < TREE_SYNC_EVERY {
+            return;
+        }
+        self.last_tree_sync = std::time::Instant::now();
+        let shared = sidebar::load_tree_state(&self.tree.root_path());
+        if apply_shared_tree_state(
+            &mut self.tree,
+            &mut self.rows,
+            &mut self.selected,
+            &mut self.scroll,
+            shared,
+        ) {
+            self.hovered = None;
+            self.snap = self.selected.is_some();
+        }
     }
 
     pub fn on_resize(&mut self, width: u16) {
@@ -945,6 +968,7 @@ impl App {
             other,
             &self.tree.root_path(),
             false,
+            None,
         );
         #[cfg(windows)]
         {
@@ -1000,8 +1024,8 @@ impl App {
         if key.code == KeyCode::Char('p')
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
-            && self.overlay.is_none()
         {
+            self.suspended_search = None;
             self.open_quick_open();
             return None;
         }
@@ -1030,11 +1054,15 @@ impl App {
                 && !key.modifiers.contains(KeyModifiers::ALT);
             let bare_switch = key.modifiers.is_empty() && self.search_text_unfocused();
             if ctrl || bare_switch {
+                if ctrl {
+                    self.overlay = None;
+                    self.suspended_search = None;
+                }
                 return match c {
                     '1' => {
                         // Explorer is this app's own tree: dropping the search
                         // overlay lands on it in-process.
-                        if matches!(self.overlay, Some(Overlay::ContentSearch { .. })) {
+                        if matches!(self.overlay, Some(Overlay::ContentSearch { .. })) || ctrl {
                             self.overlay = None;
                             if self.merged() {
                                 self.sidebar_state = sidebar::update_state(|state| {
@@ -1937,7 +1965,7 @@ impl App {
         self.quick_index_rx = None;
     }
 
-    fn open_quick_open(&mut self) {
+    pub fn open_quick_open(&mut self) {
         let root = self.tree.root_path();
         let show_hidden = self.tree.show_hidden;
         let cached = self
@@ -2942,9 +2970,8 @@ impl App {
         }
     }
 
-    /// Record the tree's shape and selection for the NEXT sidebar to start —
-    /// a tab opened for a preview comes up mirroring this one. Not a live
-    /// sync: already-open tabs are never revisited.
+    /// Publish this root's tree shape and selection. Other same-root sidebars
+    /// adopt it during their next idle tick.
     fn persist_tree(&self) {
         sidebar::save_tree_state(
             &self.tree.root_path(),
@@ -3041,27 +3068,13 @@ impl App {
     /// still exists (else the nearest valid index).
     fn rebuild(&mut self) {
         self.hovered = None;
-        let selected_path = self.selected_row().map(|r| r.path.clone());
+        rebuild_tree_rows(
+            &mut self.tree,
+            &mut self.rows,
+            &mut self.selected,
+            &mut self.scroll,
+        );
         self.persist_tree();
-        self.rows = self.tree.rows();
-        if self.rows.is_empty() {
-            self.selected = None;
-            self.scroll = 0;
-            return;
-        }
-        // Keep an EXISTING selection on its path (or nearest index); a
-        // selection-less list stays selection-less.
-        if let Some(path) = selected_path {
-            let index = self
-                .rows
-                .iter()
-                .position(|r| r.path == path)
-                .unwrap_or_else(|| self.selected.unwrap_or(0).min(self.rows.len() - 1));
-            self.selected = Some(index);
-        } else if let Some(sel) = self.selected {
-            self.selected = Some(sel.min(self.rows.len() - 1));
-        }
-        self.scroll = self.scroll.min(self.rows.len() - 1);
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
@@ -3364,7 +3377,7 @@ impl App {
             ("q", "quit"),
         ];
         if self.merged() {
-            hints.extend([("1", "files"), ("2", "git"), ("3", "search")]);
+            hints.extend([("1", "files"), ("2", "search"), ("3", "git")]);
         }
         hints
     }
@@ -4631,6 +4644,74 @@ fn row_index_at(body: BodyGeom, row_count: usize, mouse_row: u16) -> Option<usiz
     (index < row_count).then_some(index)
 }
 
+fn apply_shared_tree_state(
+    tree: &mut Tree,
+    rows: &mut Vec<Row>,
+    selected: &mut Option<usize>,
+    scroll: &mut usize,
+    mut shared: sidebar::TreeState,
+) -> bool {
+    let root = tree.root_path();
+    shared.expanded.retain(|path| path.starts_with(&root));
+    shared.expanded.sort();
+    shared.expanded.dedup();
+
+    let current_selection = selected.and_then(|index| rows.get(index).map(|row| row.path.clone()));
+    let expansion_changed = tree.expanded_paths() != shared.expanded;
+    if expansion_changed {
+        tree.set_expanded(shared.expanded);
+        *rows = tree.rows();
+    }
+
+    let desired_selection = match shared.selected {
+        Some(path) => rows.iter().position(|row| row.path == path).or_else(|| {
+            current_selection
+                .as_ref()
+                .and_then(|path| rows.iter().position(|row| &row.path == path))
+        }),
+        None => None,
+    };
+    let desired_path = desired_selection.and_then(|index| rows.get(index).map(|row| &row.path));
+    let selection_changed = current_selection.as_ref() != desired_path;
+    if selection_changed {
+        *selected = desired_selection;
+    }
+    if !expansion_changed && !selection_changed {
+        return false;
+    }
+    *scroll = if rows.is_empty() {
+        0
+    } else {
+        (*scroll).min(rows.len() - 1)
+    };
+    true
+}
+
+fn rebuild_tree_rows(
+    tree: &mut Tree,
+    rows: &mut Vec<Row>,
+    selected: &mut Option<usize>,
+    scroll: &mut usize,
+) {
+    let selected_path = selected.and_then(|index| rows.get(index).map(|row| row.path.clone()));
+    *rows = tree.rows();
+    if rows.is_empty() {
+        *selected = None;
+        *scroll = 0;
+        return;
+    }
+    if let Some(path) = selected_path {
+        let index = rows
+            .iter()
+            .position(|row| row.path == path)
+            .unwrap_or_else(|| selected.unwrap_or(0).min(rows.len() - 1));
+        *selected = Some(index);
+    } else if let Some(index) = *selected {
+        *selected = Some(index.min(rows.len() - 1));
+    }
+    *scroll = (*scroll).min(rows.len() - 1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4674,6 +4755,90 @@ mod tests {
         assert!(folder_click_toggles(false, false));
         assert!(!folder_click_toggles(false, true));
         assert!(folder_click_toggles(true, true));
+    }
+
+    #[test]
+    fn shared_tree_state_updates_expansion_and_selection() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-sidebar-tree-sync-{}-{}",
+            std::process::id(),
+            sidebar::unix_now()
+        ));
+        let src = root.join("src");
+        let nested = src.join("bin");
+        let file = nested.join("main.rs");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        let mut tree = Tree::new(root.clone());
+        let mut rows = tree.rows();
+        let mut selected = None;
+        let mut scroll = 4;
+        assert!(apply_shared_tree_state(
+            &mut tree,
+            &mut rows,
+            &mut selected,
+            &mut scroll,
+            sidebar::TreeState {
+                expanded: vec![nested, src],
+                selected: Some(file.clone()),
+            },
+        ));
+        assert_eq!(
+            selected.and_then(|index| rows.get(index)),
+            rows.iter().find(|row| row.path == file)
+        );
+        let mut expanded = tree.expanded_paths();
+        expanded.reverse();
+        assert!(!apply_shared_tree_state(
+            &mut tree,
+            &mut rows,
+            &mut selected,
+            &mut scroll,
+            sidebar::TreeState {
+                expanded,
+                selected: Some(file),
+            },
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collapsing_all_publishes_the_repointed_visible_selection() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-sidebar-tree-collapse-{}-{}",
+            std::process::id(),
+            sidebar::unix_now()
+        ));
+        let src = root.join("src");
+        let file = src.join("main.rs");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        let mut tree = Tree::new(root.clone());
+        tree.expand(&src);
+        let mut rows = tree.rows();
+        let mut selected = rows.iter().position(|row| row.path == file);
+        let mut scroll = 0;
+        tree.collapse_all();
+        rebuild_tree_rows(&mut tree, &mut rows, &mut selected, &mut scroll);
+
+        let selected_path = selected.and_then(|index| rows.get(index).map(|row| row.path.clone()));
+        assert!(selected_path.is_some());
+        let expanded = tree.expanded_paths();
+        assert!(!apply_shared_tree_state(
+            &mut tree,
+            &mut rows,
+            &mut selected,
+            &mut scroll,
+            sidebar::TreeState {
+                expanded,
+                selected: selected_path,
+            },
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
