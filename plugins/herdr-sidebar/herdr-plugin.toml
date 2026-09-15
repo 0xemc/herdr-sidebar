@@ -18,7 +18,7 @@
 
 id = "herdr-sidebar"
 name = "herdr-sidebar"
-version = "0.12.0"
+version = "0.13.0"
 description = "VS Code-style sidebar: file explorer + source control (with ✧ AI commit messages) in one herdr pane."
 min_herdr_version = "0.8.0"
 platforms = ["linux", "macos", "windows"]
@@ -81,6 +81,64 @@ platforms = ["windows"]
 title = "Toggle source control"
 description = "Open a separate Source Control pane (focus it if open; close it if focused)."
 command = [".\\target\\release\\herdr-sidebar-ensure.exe", "--toggle-git"]
+
+# Direct activities for host-level keybindings. Unlike the legacy toggles,
+# these always open/focus the sidebar and leave it on the requested view.
+[[actions]]
+id = "show-explorer"
+platforms = ["linux", "macos"]
+title = "Show Explorer"
+description = "Open or focus the sidebar and switch to Explorer."
+command = ["./target/release/herdr-sidebar", "--show-explorer"]
+
+[[actions]]
+id = "show-explorer-windows"
+platforms = ["windows"]
+title = "Show Explorer"
+description = "Open or focus the sidebar and switch to Explorer."
+command = [".\\target\\release\\herdr-sidebar-ensure.exe", "--show-explorer"]
+
+[[actions]]
+id = "show-search"
+platforms = ["linux", "macos"]
+title = "Show Search"
+description = "Open or focus the sidebar and switch to project text search."
+command = ["./target/release/herdr-sidebar", "--show-search"]
+
+[[actions]]
+id = "show-search-windows"
+platforms = ["windows"]
+title = "Show Search"
+description = "Open or focus the sidebar and switch to project text search."
+command = [".\\target\\release\\herdr-sidebar-ensure.exe", "--show-search"]
+
+[[actions]]
+id = "show-git"
+platforms = ["linux", "macos"]
+title = "Show Source Control"
+description = "Open or focus the sidebar and switch to Source Control."
+command = ["./target/release/herdr-sidebar", "--show-git"]
+
+[[actions]]
+id = "show-git-windows"
+platforms = ["windows"]
+title = "Show Source Control"
+description = "Open or focus the sidebar and switch to Source Control."
+command = [".\\target\\release\\herdr-sidebar-ensure.exe", "--show-git"]
+
+[[actions]]
+id = "quick-open"
+platforms = ["linux", "macos"]
+title = "Quick Open"
+description = "Open or focus the sidebar and show the file picker."
+command = ["./target/release/herdr-sidebar", "--quick-open"]
+
+[[actions]]
+id = "quick-open-windows"
+platforms = ["windows"]
+title = "Quick Open"
+description = "Open or focus the sidebar and show the file picker."
+command = [".\\target\\release\\herdr-sidebar-ensure.exe", "--quick-open"]
 
 # Refresh every workspace onto the latest builds after a rebuild.
 [[actions]]

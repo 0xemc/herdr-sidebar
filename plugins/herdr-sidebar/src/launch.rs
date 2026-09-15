@@ -685,6 +685,49 @@ pub fn tab_of(pane_list_json: &str, pane_id: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Any pane living in `tab_id` ("" when the tab is empty or unknown). The
+/// preview flow needs one because herdr 0.9 moves the VIEWING client only on
+/// `pane.focus`; `tab.focus` updates the session-wide record and nothing else.
+pub fn pane_in_tab(pane_list_json: &str, tab_id: &str) -> String {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return String::new();
+    };
+    msg.result
+        .panes
+        .iter()
+        .find(|p| p.tab_id.as_deref() == Some(tab_id))
+        .and_then(|p| p.pane_id.clone())
+        .unwrap_or_default()
+}
+
+/// The pane id the SERVER currently records as focused ("" when none) —
+/// unlike `focused_pane`, no cwd, no flag-safety filter.
+pub fn server_focused_pane_id(pane_list_json: &str) -> String {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return String::new();
+    };
+    msg.result
+        .panes
+        .iter()
+        .find(|p| p.focused)
+        .and_then(|p| p.pane_id.clone())
+        .unwrap_or_default()
+}
+
+/// Any pane NOT in `tab_id` ("" when there is none) — a stepping stone when a
+/// focus transition must be forced.
+pub fn pane_outside_tab(pane_list_json: &str, tab_id: &str) -> String {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return String::new();
+    };
+    msg.result
+        .panes
+        .iter()
+        .find(|p| p.tab_id.as_deref() != Some(tab_id))
+        .and_then(|p| p.pane_id.clone())
+        .unwrap_or_default()
+}
+
 /// The workspace a pane belongs to, empty when the pane is unknown. Preview
 /// routing is scoped by it so one project's ephemeral tab is never reused
 /// from another.
@@ -735,6 +778,36 @@ pub fn split_pane_id(response_json: &str) -> Option<String> {
         .pane?
         .pane_id
         .filter(|id| is_flag_safe(id))
+}
+
+/// `(tab_id, root_pane_id)` from a `tab.create` response
+/// (`{"result":{"tab":{"tab_id":..},"root_pane":{"pane_id":..}}}`), both
+/// validated flag-safe. The root pane is the tab's one shell pane — the
+/// preview flow drives it as the viewer instead of splitting a second one.
+pub fn created_tab_root_pane(response_json: &str) -> Option<(String, String)> {
+    #[derive(Deserialize)]
+    struct Msg {
+        result: Res,
+    }
+    #[derive(Deserialize)]
+    struct Res {
+        tab: Option<Tab>,
+        root_pane: Option<Pane>,
+    }
+    #[derive(Deserialize)]
+    struct Tab {
+        tab_id: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Pane {
+        pane_id: Option<String>,
+    }
+    let res = serde_json::from_str::<Msg>(strip_bom(response_json))
+        .ok()?
+        .result;
+    let tab_id = res.tab?.tab_id.filter(|id| is_flag_safe(id))?;
+    let pane_id = res.root_pane?.pane_id.filter(|id| is_flag_safe(id))?;
+    Some((tab_id, pane_id))
 }
 
 /// The created pane id from a `plugin.pane.open` response. Direct plugin-pane

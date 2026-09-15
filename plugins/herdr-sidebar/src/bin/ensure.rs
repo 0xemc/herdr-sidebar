@@ -12,6 +12,18 @@ fn main() {
         Some("--toggle-git") => {
             herdr_sidebar::ensure::Mode::Toggle(herdr_sidebar::state::View::SourceControl)
         }
+        Some("--show-explorer") => {
+            herdr_sidebar::ensure::Mode::Activate(herdr_sidebar::ensure::Target::Explorer)
+        }
+        Some("--show-search") => {
+            herdr_sidebar::ensure::Mode::Activate(herdr_sidebar::ensure::Target::Search)
+        }
+        Some("--show-git") => {
+            herdr_sidebar::ensure::Mode::Activate(herdr_sidebar::ensure::Target::SourceControl)
+        }
+        Some("--quick-open") => {
+            herdr_sidebar::ensure::Mode::Activate(herdr_sidebar::ensure::Target::QuickOpen)
+        }
         _ => herdr_sidebar::ensure::Mode::Ensure,
     };
     // Errors are deliberately silent: there is no console to print to, herdr

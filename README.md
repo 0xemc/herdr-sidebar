@@ -108,6 +108,16 @@ folder stays put until that pane changes directory again.
 Preview: drag to select, `Ctrl/Cmd+C` to copy, arrows/PageUp/PageDown to scroll,
 `w` to toggle wrapping, and `q` or Esc to close.
 
+Host keybindings can invoke the direct `show-explorer`, `show-search`, `show-git`, and
+`quick-open` actions. For example, bind `cmd+p` to:
+
+```toml
+[[keys.command]]
+key = "cmd+p"
+type = "shell"
+command = "herdr plugin action invoke quick-open --plugin herdr-sidebar"
+```
+
 ## Install & Develop
 
 **Requirements:** herdr 0.8+. Source builds require Rust 1.89+.
@@ -138,7 +148,11 @@ Useful development actions:
 |---|---|
 | `open-sidebar` / `open-sidebar-windows` | open, focus, or hide the sidebar |
 | `open-git` / `open-git-windows` | toggle separate Source Control |
+| `show-explorer`, `show-search`, `show-git` | open/focus one activity without toggling |
+| `quick-open` | open/focus the sidebar and show the file picker |
 | `redeploy` / `redeploy-windows` | refresh running sidebars after a rebuild |
+
+Use the `-windows` suffix for each direct action on Windows.
 
 All docking, metadata, pane creation, and preview control use herdr's socket API directly.
 The plugin is one Rust crate; optional external tools only enhance Markdown (`glow`), video

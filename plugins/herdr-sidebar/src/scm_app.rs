@@ -32,10 +32,11 @@ use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::suggest;
 use herdr_sidebar::ui::{
     TitleAction, activity_button_style, activity_icons, branch_icon, chrome_button_style,
-    draw_activity_caps, draw_scrollbar, gear_icon, hits, hits_collapse_button, hover_style,
-    icon_style as ui_icon_style, keep_visible_scroll, palette, selection_style, set_color_theme,
-    sibling_panes_of, sparkle_icon, status_color, title_action_spans, title_actions_visible,
-    title_actions_width, truncate_to, within, wrap_footer_message, wrap_hints,
+    draw_activity_caps, draw_scrollbar, gear_icon, hits, hits_activity_button,
+    hits_collapse_button, hover_style, icon_style as ui_icon_style, keep_visible_scroll, palette,
+    selection_style, set_color_theme, sibling_panes_of, sparkle_icon, status_color,
+    title_action_spans, title_actions_visible, title_actions_width, truncate_to, within,
+    wrap_footer_message, wrap_hints,
 };
 
 /// How many log lines the history-ish drawers fetch.
@@ -1267,6 +1268,45 @@ impl App {
             return None;
         }
         self.flash = None;
+        if ((key.code == KeyCode::Char('p')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT))
+            || key.code == KeyCode::F(12))
+            && self.merged()
+        {
+            self.sidebar_state = sidebar::update_state(|state| {
+                state.active = View::Explorer;
+                state.search_active = false;
+            });
+            return Some(Exit::QuickOpen);
+        }
+        // View switching has to reach past the commit message box, where bare
+        // 1/2/3 type into the draft — Ctrl+1/2/3 mirror VS Code's activity bar
+        // from any focus (1 Explorer, 2 Search, 3 Source Control). Bare 1/2/3
+        // still switch from the file list.
+        let injected_view = match key.code {
+            KeyCode::F(9) => Some('1'),
+            KeyCode::F(10) => Some('2'),
+            KeyCode::F(11) => Some('3'),
+            _ => None,
+        };
+        let keyboard_view = match key.code {
+            KeyCode::Char(c @ ('1' | '2' | '3'))
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                Some(c)
+            }
+            _ => None,
+        };
+        if let Some(c) = injected_view.or(keyboard_view) {
+            self.overlay = None;
+            return match c {
+                '1' => self.switch_to(View::Explorer),
+                '2' => self.open_search(false),
+                _ => self.switch_to(View::SourceControl),
+            };
+        }
         if self.overlay.is_some() {
             self.overlay_key(key);
             return None;
@@ -1276,20 +1316,6 @@ impl App {
             && !key.modifiers.contains(KeyModifiers::ALT)
         {
             return self.open_search(true);
-        }
-        // View switching has to reach past the commit message box, where bare
-        // 1/2/3 type into the draft — Ctrl+1/2/3 mirror VS Code's activity bar
-        // from any focus (1 Explorer, 2 Search, 3 Source Control). Bare 1/2/3
-        // still switch from the file list.
-        if let KeyCode::Char(c @ ('1' | '2' | '3')) = key.code
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT)
-        {
-            return match c {
-                '1' => self.switch_to(View::Explorer),
-                '2' => self.open_search(false),
-                _ => self.switch_to(View::SourceControl),
-            };
         }
         match self.focus {
             Focus::Message => self.on_message_key(key),
@@ -1427,14 +1453,14 @@ impl App {
         }
         let (x, y) = (mouse.column, mouse.row);
         let z = self.zones;
-        if self.merged() && y == z.activity_row {
-            if within(x, z.explorer) {
+        if self.merged() {
+            if hits_activity_button(z.explorer, z.activity_row, x, y) {
                 return self.switch_to(View::Explorer);
             }
-            if within(x, z.search) {
+            if hits_activity_button(z.search, z.activity_row, x, y) {
                 return self.open_search(false);
             }
-            if within(x, z.source_control) {
+            if hits_activity_button(z.source_control, z.activity_row, x, y) {
                 return self.switch_to(View::SourceControl);
             }
         }
@@ -2886,7 +2912,7 @@ impl App {
         );
         let other = MY_VIEW.other();
         #[cfg(unix)]
-        let _ = herdr_sidebar::ipc::open_plugin_pane(&ctl.pane_id, other, &self.cwd, false);
+        let _ = herdr_sidebar::ipc::open_plugin_pane(&ctl.pane_id, other, &self.cwd, false, None);
         #[cfg(windows)]
         {
             let response = herdr_sidebar::ipc::call_text(
@@ -3404,10 +3430,9 @@ impl App {
         self.zones.explorer = bounds[1];
         self.zones.search = bounds[3];
         self.zones.source_control = bounds[5];
-        let hovered = |(start, end): (u16, u16)| {
-            self.mouse_pos.is_some_and(|(x, y)| {
-                (outer_top..=outer_bottom).contains(&y) && (start..end).contains(&x)
-            })
+        let hovered = |bounds| {
+            self.mouse_pos
+                .is_some_and(|(x, y)| hits_activity_button(bounds, area.y, x, y))
         };
         let explorer_hovered = hovered(bounds[1]);
         let search_hovered = hovered(bounds[3]);
@@ -3438,10 +3463,10 @@ impl App {
         let gear_text = format!(" {} ", gear_icon(self.theme));
         let gear_w = Span::raw(gear_text.as_str()).width() as u16;
         let gear_x = area.x + area.width.saturating_sub(gear_w);
-        self.zones.gear = Rect::new(gear_x, area.y, gear_w, 1);
-        let gear_hovered = self.mouse_pos.is_some_and(|(x, y)| {
-            (gear_x..gear_x + gear_w).contains(&x) && (outer_top..=outer_bottom).contains(&y)
-        });
+        self.zones.gear = Rect::new(gear_x, outer_top, gear_w, 3);
+        let gear_hovered = self
+            .mouse_pos
+            .is_some_and(|(x, y)| hits(self.zones.gear, x, y));
         let gear = Span::styled(gear_text, activity_button_style(false, gear_hovered));
         if gear_hovered {
             draw_activity_caps(
@@ -3937,7 +3962,7 @@ impl App {
             ("q", "quit"),
         ];
         if self.merged() {
-            hints.extend([("1", "files"), ("2", "git")]);
+            hints.extend([("1", "files"), ("2", "search"), ("3", "git")]);
         }
         hints
     }

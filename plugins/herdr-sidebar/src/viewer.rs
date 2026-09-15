@@ -110,7 +110,7 @@ fn control_from_token(token: &str) -> PathBuf {
     }
 }
 
-fn document_token(doc_key: &str) -> String {
+pub(crate) fn document_token(doc_key: &str) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in doc_key.as_bytes() {
         hash ^= u64::from(*byte);
@@ -1404,14 +1404,42 @@ fn close_own_pane(control: &Path) -> bool {
     true
 }
 
+/// Bring the VIEWING client to `tab_id`. Since herdr 0.9 each client views
+/// its own tab: `tab.focus` (and `pane.move`'s `focus: true`) only update the
+/// session-wide focus record, which a client no longer follows, so the tab
+/// opened "in the back" and the origin tab was left with a stale split.
+/// `pane.focus` is the one call that still moves the client — but only on a
+/// TRANSITION: if the server already records the target as focused (it kept
+/// that record from the last preview while the user clicked elsewhere), the
+/// call changes nothing and emits nothing. Step through another pane first
+/// in that case. Falls back to `tab.focus` for hosts older than 0.9 and for
+/// tabs whose panes cannot be listed.
+pub(crate) fn focus_tab_for_client(tab_id: &str, pane_id: Option<&str>) {
+    let list = ipc::call_text("pane.list", serde_json::json!({})).unwrap_or_default();
+    let pane = match pane_id {
+        Some(pane) if !pane.is_empty() => pane.to_string(),
+        _ => crate::launch::pane_in_tab(&list, tab_id),
+    };
+    if pane.is_empty() {
+        let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": tab_id }));
+        return;
+    }
+    if crate::launch::server_focused_pane_id(&list) == pane {
+        let step = crate::launch::pane_outside_tab(&list, tab_id);
+        if !step.is_empty() {
+            let _ = ipc::call_text("pane.focus", serde_json::json!({ "pane_id": step }));
+        }
+    }
+    if ipc::call_text("pane.focus", serde_json::json!({ "pane_id": pane })).is_err() {
+        let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": tab_id }));
+    }
+}
+
 fn close_preview_tab(preview: &PreviewPane) {
     // Focus first: closing our own tab kills this process, so code after a
     // successful tab.close is not guaranteed to run.
     if !preview.origin_tab_id.is_empty() {
-        let _ = ipc::call_text(
-            "tab.focus",
-            serde_json::json!({ "tab_id": preview.origin_tab_id }),
-        );
+        focus_tab_for_client(&preview.origin_tab_id, None);
     }
     let _ = ipc::call_text("tab.close", serde_json::json!({ "tab_id": preview.tab_id }));
 }
@@ -2144,7 +2172,7 @@ pub fn open_in_pane(
         write_scratch_file(&p.control, payload).map_err(|e| format!("preview failed: {e}"))?;
         remember_origin(&p.pane_id, &origin_tab_id);
         if !inline {
-            let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": p.tab_id }));
+            focus_tab_for_client(&p.tab_id, Some(&p.pane_id));
         }
         return Ok(PreviewTarget {
             pane_id: p.pane_id,
@@ -2159,7 +2187,7 @@ pub fn open_in_pane(
         write_scratch_file(&p.control, payload).map_err(|e| format!("preview failed: {e}"))?;
         remember_origin(&p.pane_id, &origin_tab_id);
         if !inline {
-            let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": p.tab_id }));
+            focus_tab_for_client(&p.tab_id, Some(&p.pane_id));
         }
         return Ok(PreviewTarget {
             pane_id: p.pane_id,
@@ -2245,10 +2273,12 @@ fn target_is_showing(previews: &[PreviewPane], target: &PreviewTarget, doc_key: 
     })
 }
 
-/// Spawn a preview and give it its own tab. The pane is split beside the
-/// sidebar first and then MOVED out: `tab.create` would leave a stray shell
-/// pane, and the move reuses the proven `pane.move` path. The `tab.created`
-/// hook docks a sidebar alongside it, so the tree stays reachable.
+/// Spawn a preview in a tab of its own. The viewer is the new tab's ROOT
+/// pane (`tab.create` with the viewer's cwd/env), so the origin tab is never
+/// split into and never has a pane moved out of it — on herdr 0.9 those two
+/// layout changes reached the client as a visible flicker, and its re-fit of
+/// the origin tab lagged. The `tab.created` hook docks a sidebar alongside,
+/// so the tree stays reachable.
 fn spawn_preview_tab(
     my_pane_id: &str,
     spawn_cwd: &Path,
@@ -2256,32 +2286,7 @@ fn spawn_preview_tab(
     payload: &str,
     origin_tab_id: &str,
 ) -> Result<PreviewTarget, String> {
-    let (new_pane, control) = spawn_viewer_pane(my_pane_id, spawn_cwd, doc_key, payload, None)?;
-    let moved = match ipc::call_text(
-        "pane.move",
-        serde_json::json!({
-            "pane_id": new_pane,
-            "destination": { "type": "new_tab", "label": tab_label(doc_key, false) },
-            "focus": true,
-        }),
-    ) {
-        Ok(response) => response,
-        Err(error) => {
-            cleanup_spawn(&new_pane, &control);
-            return Err(format!("preview tab failed to open: {error}"));
-        }
-    };
-    if !pane_move_changed(&moved) {
-        cleanup_spawn(&new_pane, &control);
-        return Err("preview tab failed to open".into());
-    }
-    let tab_id = ipc::call_text("pane.list", serde_json::json!({}))
-        .map(|list| crate::launch::tab_of(&list, &new_pane))
-        .unwrap_or_default();
-    if tab_id.is_empty() {
-        cleanup_spawn(&new_pane, &control);
-        return Err("preview tab opened without a tab id".into());
-    }
+    let (new_pane, tab_id, control) = create_viewer_tab(my_pane_id, spawn_cwd, doc_key, payload)?;
     if !mark_dedicated_preview(&new_pane) {
         cleanup_moved_spawn(&new_pane, &tab_id, &control);
         return Err("preview tab could not record ownership".into());
@@ -2291,6 +2296,9 @@ fn spawn_preview_tab(
         cleanup_moved_spawn(&new_pane, &tab_id, &control);
         return Err("preview process failed to start".into());
     }
+    // Bring the client along. `tab.create` ran with `focus: false` so this
+    // is a real focus transition — the only kind a 0.9 client follows.
+    focus_tab_for_client(&tab_id, Some(&new_pane));
     Ok(PreviewTarget {
         pane_id: new_pane,
         tab_id,
@@ -2677,8 +2685,6 @@ fn spawn_viewer_pane(
     inline: Option<InlineSpawn>,
 ) -> Result<(String, PathBuf), String> {
     let control = fresh_control_path();
-    let doc_token = document_token(doc_key);
-    let control_token = control_token(&control);
     write_scratch_file(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
     let layout = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": my_pane_id })).ok();
     let plan = match inline {
@@ -2734,12 +2740,69 @@ fn spawn_viewer_pane(
         cleanup_spawn(&new_pane, &control);
         return Err("preview pane could not be positioned".into());
     }
+    register_viewer_pane(&new_pane, &control, doc_key, inline.is_some())?;
+    Ok((new_pane, control))
+}
+
+/// Spawn the viewer's shell pane as the ROOT pane of a brand-new tab. This is
+/// the tab-placement counterpart of `spawn_viewer_pane`: nothing is split into
+/// the origin tab and nothing is moved out of it again, so the tab the user
+/// clicked from never changes shape (herdr 0.9 clients redraw those two
+/// layout changes as a visible flicker, and re-fit lazily). `tab.create`
+/// takes the same cwd/env as `pane.split`, so the root pane is driven exactly
+/// like a split one; `focus: false` keeps the later `pane.focus` a real
+/// transition. Returns (pane_id, tab_id, control).
+fn create_viewer_tab(
+    my_pane_id: &str,
+    spawn_cwd: &Path,
+    doc_key: &str,
+    payload: &str,
+) -> Result<(String, String, PathBuf), String> {
+    let control = fresh_control_path();
+    write_scratch_file(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
+    let workspace_id = ipc::call_text("pane.list", serde_json::json!({}))
+        .map(|list| crate::launch::workspace_of(&list, my_pane_id))
+        .unwrap_or_default();
+    let mut params = serde_json::json!({
+        "label": tab_label(doc_key, false),
+        "focus": false,
+        "cwd": spawn_cwd.display().to_string(),
+        "env": preview_spawn_env(&control, false),
+    });
+    if !workspace_id.is_empty() {
+        params["workspace_id"] = serde_json::Value::String(workspace_id);
+    }
+    let response = ipc::call_text("tab.create", params).ok();
+    let Some((tab_id, new_pane)) = response
+        .as_deref()
+        .and_then(crate::launch::created_tab_root_pane)
+    else {
+        let _ = std::fs::remove_file(&control);
+        return Err("preview tab failed to open".into());
+    };
+    if let Err(error) = register_viewer_pane(&new_pane, &control, doc_key, false) {
+        let _ = ipc::call_text("tab.close", serde_json::json!({ "tab_id": tab_id }));
+        return Err(error);
+    }
+    Ok((new_pane, tab_id, control))
+}
+
+/// Stamp a freshly spawned shell pane as ours: the document/control tokens
+/// the sidebar routes clicks by, plus the "Preview" label. Closes the pane
+/// (and drops the control file) when the stamp does not land, so an unowned
+/// shell never lingers.
+fn register_viewer_pane(
+    new_pane: &str,
+    control: &Path,
+    doc_key: &str,
+    inline: bool,
+) -> Result<(), String> {
     let mut tokens = serde_json::json!({
         METADATA_SOURCE: crate::state::unix_now().to_string(),
-        TOKEN_PATH: doc_token,
-        TOKEN_CONTROL: control_token,
+        TOKEN_PATH: document_token(doc_key),
+        TOKEN_CONTROL: control_token(control),
     });
-    if inline.is_some() {
+    if inline {
         tokens[TOKEN_INLINE] = serde_json::Value::String("1".into());
     }
     if !ipc::call_text(
@@ -2752,14 +2815,14 @@ fn spawn_viewer_pane(
     )
     .is_ok_and(|response| ipc_succeeded(&response))
     {
-        cleanup_spawn(&new_pane, &control);
+        cleanup_spawn(new_pane, control);
         return Err("preview pane could not be identified".into());
     }
     let _ = ipc::call_text(
         "pane.rename",
         serde_json::json!({ "pane_id": new_pane, "label": "Preview" }),
     );
-    Ok((new_pane, control))
+    Ok(())
 }
 
 fn start_viewer_pane(pane_id: &str) -> bool {
@@ -2798,19 +2861,6 @@ fn cleanup_moved_spawn(pane_id: &str, tab_id: &str, control: &Path) {
     } else {
         let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
     }
-}
-
-fn pane_move_changed(response: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(crate::launch::strip_bom(response))
-        .ok()
-        .and_then(|value| {
-            value
-                .get("result")?
-                .get("move_result")?
-                .get("changed")?
-                .as_bool()
-        })
-        .unwrap_or(false)
 }
 
 fn ipc_succeeded(response: &str) -> bool {
@@ -3827,12 +3877,23 @@ mod tests {
     }
 
     #[test]
-    fn pane_move_requires_a_changed_success_result() {
-        let moved = r#"{"result":{"type":"pane_move","move_result":{"changed":true}}}"#;
-        let refused = r#"{"result":{"type":"pane_move","move_result":{"changed":false}}}"#;
-        assert!(pane_move_changed(moved));
-        assert!(!pane_move_changed(refused));
-        assert!(!pane_move_changed(r#"{"error":{"message":"nope"}}"#));
+    fn tab_create_yields_tab_and_root_pane_or_nothing() {
+        use crate::launch::created_tab_root_pane;
+        let created = r#"{"result":{"type":"tab_created","tab":{"tab_id":"w9:tX","label":"x · preview"},"root_pane":{"pane_id":"w9:p1E","tab_id":"w9:tX"}}}"#;
+        assert_eq!(
+            created_tab_root_pane(created),
+            Some(("w9:tX".into(), "w9:p1E".into()))
+        );
+        // A tab without a pane id is unusable as a viewer; so is an error.
+        let no_pane = r#"{"result":{"type":"tab_created","tab":{"tab_id":"w9:tX"}}}"#;
+        assert_eq!(created_tab_root_pane(no_pane), None);
+        assert_eq!(
+            created_tab_root_pane(r#"{"error":{"message":"nope"}}"#),
+            None
+        );
+        // Ids that could be mistaken for CLI flags are rejected like everywhere else.
+        let flaggy = r#"{"result":{"tab":{"tab_id":"--tab"},"root_pane":{"pane_id":"w9:p1"}}}"#;
+        assert_eq!(created_tab_root_pane(flaggy), None);
     }
 
     #[cfg(unix)]

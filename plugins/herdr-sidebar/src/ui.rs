@@ -564,6 +564,11 @@ pub fn within(x: u16, (start, end): (u16, u16)) -> bool {
     (start..end).contains(&x)
 }
 
+pub fn hits_activity_button((start, end): (u16, u16), middle_row: u16, x: u16, y: u16) -> bool {
+    within(x, (start, end))
+        && (middle_row.saturating_sub(1)..=middle_row.saturating_add(1)).contains(&y)
+}
+
 pub fn hits(rect: Rect, x: u16, y: u16) -> bool {
     x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
 }
@@ -786,6 +791,15 @@ mod tests {
         let idle = activity_button_style(false, false);
         assert!(idle.add_modifier.contains(Modifier::DIM));
         assert!(idle.bg.is_none());
+    }
+
+    #[test]
+    fn activity_button_hitbox_matches_all_three_highlight_rows() {
+        for row in 4..=6 {
+            assert!(hits_activity_button((10, 14), 5, 12, row));
+        }
+        assert!(!hits_activity_button((10, 14), 5, 9, 5));
+        assert!(!hits_activity_button((10, 14), 5, 12, 7));
     }
 
     #[test]

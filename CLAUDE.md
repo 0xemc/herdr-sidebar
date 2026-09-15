@@ -552,6 +552,14 @@ HACKING.md — budget time for that before promising a patched build.
   prebuilts must behave consistently on fresh machines. Build and cache the index on a worker
   polled from `App::tick`: a user-selected root can be enormous, and a synchronous walk can
   starve the heartbeat long enough for the launcher to replace a healthy pane as stale.
+- Host-remappable activity actions (`show-explorer`, `show-search`, `show-git`, and
+  `quick-open`, each with a Windows-suffixed twin) route through native `ensure::Mode::Activate`.
+  They never toggle closed: an existing pane receives an F9–F12 transport key that the PTY decoder
+  emits reliably, while a fresh pane receives `HERDR_SIDEBAR_INITIAL_ACTIVITY` so it starts on the
+  exact requested view without racing terminal input against its shell/TUI startup. Do not use
+  synthetic Ctrl+number here: legacy terminal encoding turns Ctrl+3 into Escape. This is also how
+  a host `cmd+p` binding opens Quick Open without pretending terminals can portably report the
+  Command key.
 - Project content search accepts both `Ctrl+F` and `Ctrl+Shift+F`: terminals that collapse the
   shifted chord still reach the same action. It uses the bundled `ignore` walker on a worker,
   follows the Explorer hidden-file setting, skips `.git`, binary files, and files over 1 MiB,
@@ -589,7 +597,11 @@ HACKING.md — budget time for that before promising a patched build.
 - Custom terminal editors are opt-in. The saved command is parsed into argv and launched directly,
   never through a shell; `{file}` is substituted in arguments or appended when absent. Mouse file
   clicks may open the command in a new herdr tab, while keyboard Enter always retains the built-in
-  preview. The saved command wins over `HERDR_SIDEBAR_EDITOR`, `VISUAL`, and `EDITOR` fallbacks.
+  preview. Editor panes are keyed by a canonical absolute-path hash in `hs-editor-path`, scoped to
+  their workspace, and heartbeat every 5s against the common 20s stale limit; clicking that file
+  again focuses the live pane through `focus_tab_for_client` instead of launching a duplicate. The
+  token is cleared when the editor exits. The saved command wins over `HERDR_SIDEBAR_EDITOR`,
+  `VISUAL`, and `EDITOR` fallbacks.
 - **Title-bar action buttons** (`ui.rs` `TitleAction`/`title_action_spans`): VS Code-style
   hover buttons at the header's top-right (Explorer: New File / New Folder / Refresh /
   Collapse All; SCM: Refresh / Collapse All), left of the standalone ⚙. Terminals emit NO
@@ -791,10 +803,12 @@ setting are all gone.
   FILE HISTORY target, scroll — keyed by workspace cwd AND each discovered repo root so a
   nested-repo preview tab restores the originating state). SCM keys and active roots normalize
   `\` to `/`: Git commonly reports forward slashes on Windows while pane cwd uses backslashes,
-  and treating them as different paths silently loses the mirror. Captured at sidebar STARTUP only,
-  deliberately not a
-  live sync; the SCM side saves on user-action paths to avoid timer write-churn. Paths
-  outside the tree's root are dropped on load, since one file serves every workspace.
+  and treating them as different paths silently loses the mirror. Explorer panes also re-read
+  their root-keyed tree entry on each idle tick and adopt changed expansion/selection, so
+  same-root tabs converge live and a preview tab lands on the file that opened it. Reads share
+  the writer's OS lock and normalize expansion order before comparing, avoiding partial JSON and
+  needless rebuild loops. SCM remains startup-only and saves on user-action paths to avoid timer
+  write-churn. Paths outside the tree's root are dropped, since one file serves every workspace.
 - Sidebar roots are remembered per **workspace label + normalized spawn cwd**. A workspace
   can hold unrelated project tabs, so label-only keys race and leak roots across those tabs;
   tab ids change across server restarts and would grow `roots.json` forever. The project-path

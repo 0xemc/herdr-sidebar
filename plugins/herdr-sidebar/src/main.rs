@@ -33,6 +33,18 @@ fn main() -> std::io::Result<()> {
         Some("--toggle-git") => {
             return ensure::run(ensure::Mode::Toggle(View::SourceControl));
         }
+        Some("--show-explorer") => {
+            return ensure::run(ensure::Mode::Activate(ensure::Target::Explorer));
+        }
+        Some("--show-search") => {
+            return ensure::run(ensure::Mode::Activate(ensure::Target::Search));
+        }
+        Some("--show-git") => {
+            return ensure::run(ensure::Mode::Activate(ensure::Target::SourceControl));
+        }
+        Some("--quick-open") => {
+            return ensure::run(ensure::Mode::Activate(ensure::Target::QuickOpen));
+        }
         Some("--run-custom-editor") => return herdr_sidebar::actions::run_configured_editor(),
         Some("--launch-decision") => {
             // Optional second arg picks the source-control decision; default
@@ -155,7 +167,7 @@ fn main() -> std::io::Result<()> {
         Some(other) => {
             eprintln!("herdr-sidebar: unknown argument `{other}`");
             eprintln!(
-                "usage: herdr-sidebar [--view explorer|git|--preview [ctl]|--run-custom-editor|--ensure|--toggle|--toggle-git|--launch-decision [git]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--auto-open|--focus-on-open|--dock-right]"
+                "usage: herdr-sidebar [--view explorer|git|--preview [ctl]|--run-custom-editor|--ensure|--toggle|--toggle-git|--show-explorer|--show-search|--show-git|--quick-open|--launch-decision [git]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--auto-open|--focus-on-open|--dock-right]"
             );
             std::process::exit(2);
         }
@@ -173,12 +185,20 @@ fn main() -> std::io::Result<()> {
         None
     };
     let persisted = state::load_state();
+    let initial_activity = std::env::var(state::INITIAL_ACTIVITY_ENV)
+        .ok()
+        .and_then(|value| ensure::Target::from_env_value(&value));
     herdr_sidebar::ui::set_color_theme(persisted.color_theme);
-    let mut view = pinned.unwrap_or(if persisted.merged {
-        persisted.active
-    } else {
-        View::Explorer
-    });
+    let mut view = initial_activity.map_or_else(
+        || {
+            pinned.unwrap_or(if persisted.merged {
+                persisted.active
+            } else {
+                View::Explorer
+            })
+        },
+        ensure::Target::initial_view,
+    );
 
     // Unix launchers use plugin.pane.open so Herdr starts this argv directly,
     // with no shell prompt between the split and the TUI. Keep the host's cwd
@@ -226,11 +246,16 @@ fn main() -> std::io::Result<()> {
     let root_key = remembered_root_key(&workspace_label, &spawn_cwd);
     // Some(focus_query) opens the Search view on the next Explorer render;
     // None doesn't. A resumed search restores unfocused (a switch, not a find).
-    let mut search_on_open: Option<bool> = (pinned.is_none()
-        && persisted.merged
-        && persisted.active == View::Explorer
-        && persisted.search_active)
-        .then_some(false);
+    let mut search_on_open: Option<bool> = if initial_activity == Some(ensure::Target::Search) {
+        Some(false)
+    } else {
+        (pinned.is_none()
+            && persisted.merged
+            && persisted.active == View::Explorer
+            && persisted.search_active)
+            .then_some(false)
+    };
+    let mut quick_open_on_open = initial_activity == Some(ensure::Target::QuickOpen);
     let result = loop {
         let exit = match view {
             View::Explorer => run_explorer(
@@ -240,6 +265,7 @@ fn main() -> std::io::Result<()> {
                 &workspace_label,
                 &spawn_cwd,
                 std::mem::take(&mut search_on_open),
+                std::mem::take(&mut quick_open_on_open),
             ),
             View::SourceControl => run_scm(
                 &mut terminal,
@@ -257,6 +283,10 @@ fn main() -> std::io::Result<()> {
             Ok(Exit::Search { focus_query }) => {
                 view = View::Explorer;
                 search_on_open = Some(focus_query);
+            }
+            Ok(Exit::QuickOpen) => {
+                view = View::Explorer;
+                quick_open_on_open = true;
             }
             Err(e) => break Err(e),
         }
@@ -332,12 +362,16 @@ fn run_explorer(
     legacy_workspace_label: &str,
     spawn_cwd: &std::path::Path,
     search_on_open: Option<bool>,
+    quick_open_on_open: bool,
 ) -> std::io::Result<Exit> {
     let root = resolve_root(root_key, legacy_workspace_label, spawn_cwd)?;
     let mut remembered_root = root.clone();
     let mut app = explorer_app::App::new(root, cwd_follower);
     if let Some(focus_query) = search_on_open {
         app.open_content_search(focus_query);
+    }
+    if quick_open_on_open {
+        app.open_quick_open();
     }
     loop {
         terminal.draw(|frame| app.draw(frame))?;
