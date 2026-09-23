@@ -1,0 +1,179 @@
+name: PR Bot
+
+on:
+  pull_request_review:
+    types: [submitted]
+  check_run:
+    types: [completed]
+  workflow_call:
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+      DEEPSEEK_API_KEY:
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+# Cancel any in-progress run for the same ref to avoid parallel Aider conflicts
+concurrency:
+  group: ai-pr-loop-${{ github.head_ref || github.event.check_run.head_sha }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Job 1: Address reviewer-submitted comments ────────────────────────────
+  review-loop:
+    name: Address PR Review Comments
+    if: |
+      github.event_name == 'pull_request_review' &&
+      github.event.review.state != 'approved'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Codebase
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      - name: Fetch and Batch All Review Comments
+        id: batch_comments
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REVIEW_BODY: ${{ github.event.review.body }}
+        run: |
+          PR_NUM=${{ github.event.pull_request.number }}
+          REVIEW_ID=${{ github.event.review.id }}
+
+          # Collect all inline comments for this specific review via REST API
+          INLINE=$(gh api "/repos/${{ github.repository }}/pulls/$PR_NUM/reviews/$REVIEW_ID/comments" \
+            --jq '.[] | "- In file " + .path + " on line " + (.line | tostring) + ": " + .body')
+
+          # Always include the top-level review body when present, then append inline
+          # comments beneath it — both sources must be addressed.
+          COMBINED=""
+
+          if [ -n "$REVIEW_BODY" ]; then
+            COMBINED="Review summary:
+          $REVIEW_BODY"
+          fi
+
+          if [ -n "$INLINE" ]; then
+            if [ -n "$COMBINED" ]; then
+              COMBINED="$COMBINED
+
+          Inline comments:
+          $INLINE"
+            else
+              COMBINED="Inline comments:
+          $INLINE"
+            fi
+          fi
+
+          if [ -z "$COMBINED" ]; then
+            echo "No actionable review content found — skipping."
+            exit 0
+          fi
+
+          {
+            echo "BATCHED_PROMPT<<EOF"
+            printf '%s' "$COMBINED"
+            echo ""
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run AI Loop
+        uses: ./.github/actions/aider-run
+        with:
+          prompt: |
+            A PR reviewer submitted the following feedback. Address every point —
+            both the review summary and all inline comments — systematically before finishing:
+
+            ${{ steps.batch_comments.outputs.BATCHED_PROMPT }}
+          pr_number: ${{ github.event.pull_request.number }}
+          branch: ${{ github.event.pull_request.head.ref }}
+          base_ref: ${{ github.event.pull_request.base.ref }}
+          commit_message: "chore(ai): address review comments [skip ci]"
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          deepseek_api_key: ${{ secrets.DEEPSEEK_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Job 2: Fix a failed CI check on an open PR ────────────────────────────
+  ci-fix-loop:
+    name: Fix Failed CI Build
+    if: |
+      github.event_name == 'check_run' &&
+      github.event.check_run.conclusion == 'failure' &&
+      !startsWith(github.event.check_run.name, 'Address PR Review') &&
+      !startsWith(github.event.check_run.name, 'Fix Failed CI')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Find Associated PR
+        id: pr_info
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          COMMIT_SHA="${{ github.event.check_run.head_sha }}"
+
+          PR_NUM=$(gh pr list --state open \
+            --json number,headRefOid \
+            --jq ".[] | select(.headRefOid == \"$COMMIT_SHA\") | .number" \
+            | head -1)
+
+          if [ -z "$PR_NUM" ]; then
+            echo "No open PR found for commit $COMMIT_SHA — skipping."
+            exit 0
+          fi
+
+          BRANCH=$(gh pr view "$PR_NUM" --json headRefName --jq '.headRefName')
+          BASE_REF=$(gh pr view "$PR_NUM" --json baseRefName --jq '.baseRefName')
+          echo "pr_number=$PR_NUM"  >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH"     >> "$GITHUB_OUTPUT"
+          echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Codebase
+        if: steps.pr_info.outputs.branch != ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr_info.outputs.branch }}
+          fetch-depth: 0
+
+      - name: Fetch Build Failure Output
+        id: build_logs
+        if: steps.pr_info.outputs.branch != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CHECK_RUN_ID="${{ github.event.check_run.id }}"
+
+          LOGS=$(gh api \
+            "/repos/${{ github.repository }}/check-runs/$CHECK_RUN_ID" \
+            --jq '.output.text // .output.summary // "No log output available."' \
+            | head -c 6000)
+
+          {
+            echo "BUILD_LOGS<<EOF"
+            echo "$LOGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run AI Loop
+        if: steps.pr_info.outputs.branch != ''
+        uses: ./.github/actions/aider-run
+        with:
+          prompt: |
+            The CI check '${{ github.event.check_run.name }}' failed on this PR.
+            Diagnose the root cause using the build output below and apply the
+            minimal fix needed to make it pass:
+
+            ${{ steps.build_logs.outputs.BUILD_LOGS }}
+          pr_number: ${{ steps.pr_info.outputs.pr_number }}
+          branch: ${{ steps.pr_info.outputs.branch }}
+          base_ref: ${{ steps.pr_info.outputs.base_ref }}
+          commit_message: "chore(ai): fix CI failure '${{ github.event.check_run.name }}' [skip ci]"
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          deepseek_api_key: ${{ secrets.DEEPSEEK_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}

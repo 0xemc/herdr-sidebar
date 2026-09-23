@@ -1,0 +1,113 @@
+name: Aider Run
+description: Run Aider, push changes, post a summary comment, and update the PR description.
+
+inputs:
+  prompt:
+    description: Message to pass to Aider
+    required: true
+  pr_number:
+    description: PR number to comment on and update
+    required: true
+  branch:
+    description: Branch to push changes to
+    required: true
+  base_ref:
+    description: Base branch for generating the diff
+    required: true
+  commit_message:
+    description: Git commit message for the AI changes
+    required: false
+    default: "chore(ai): apply AI changes [skip ci]"
+  model:
+    description: Aider architect model (provider/model form, e.g. deepseek/deepseek-chat)
+    required: false
+    default: "deepseek/deepseek-chat"
+  editor_model:
+    description: Aider editor model and the model used for summary comment + PR description updates (provider/model form, e.g. anthropic/claude-sonnet-4-6)
+    required: false
+    default: "anthropic/claude-sonnet-4-6"
+  anthropic_api_key:
+    required: true
+  deepseek_api_key:
+    required: true
+  github_token:
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Aider
+      shell: bash
+      run: pip install aider-chat
+
+    - name: Run Aider
+      shell: bash
+      env:
+        DEEPSEEK_API_KEY: ${{ inputs.deepseek_api_key }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        AIDER_PROMPT: ${{ inputs.prompt }}
+        MODEL: ${{ inputs.model }}
+        EDITOR_MODEL: ${{ inputs.editor_model }}
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+        aider --architect \
+              --model "$MODEL" \
+              --editor-model "$EDITOR_MODEL" \
+              --yes-always \
+              --message "$AIDER_PROMPT" | tee /tmp/aider-output.txt
+
+    - name: Push Changes
+      shell: bash
+      env:
+        BRANCH: ${{ inputs.branch }}
+      run: |
+        git checkout -- .gitignore
+        git clean -fdx -- '.aider*'
+        git push origin "HEAD:$BRANCH"
+
+    - name: Post Summary Comment
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        EDITOR_MODEL: ${{ inputs.editor_model }}
+      run: |
+        AIDER_OUTPUT=$(tail -c 4000 /tmp/aider-output.txt)
+
+        PROMPT=$(printf 'Summarise what was implemented in one short paragraph. Be direct and specific about what changed. No preamble.\n\n%s' "$AIDER_OUTPUT")
+        COMMENT=$(bash "$GITHUB_ACTION_PATH/llm.sh" \
+          --model "$EDITOR_MODEL" \
+          --max-tokens 256 \
+          --prompt "$PROMPT")
+
+        gh pr comment "$PR_NUMBER" --body "$(printf '**AI Review Bot**\n\n%s' "$COMMENT")"
+
+    - name: Update PR Description
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        BASE_REF: ${{ inputs.base_ref }}
+        EDITOR_MODEL: ${{ inputs.editor_model }}
+      run: |
+        CURRENT_BODY=$(gh pr view "$PR_NUMBER" --json body --jq '.body')
+        git diff "origin/$BASE_REF...HEAD" > /tmp/pr.diff
+        DIFF=$(head -c 8000 /tmp/pr.diff)
+        AIDER_SUMMARY=$(tail -c 2000 /tmp/aider-output.txt)
+
+        PROMPT=$(printf 'Update this PR description to reflect the current AI changes. Preserve the original structure exactly — keep all existing sections, headings, and formatting. Only update content within sections where the changes are relevant. Return only the updated description text, no preamble.\n\nCurrent description:\n%s\n\nAI changes summary:\n%s\n\nDiff:\n%s' "$CURRENT_BODY" "$AIDER_SUMMARY" "$DIFF")
+        NEW_BODY=$(bash "$GITHUB_ACTION_PATH/llm.sh" \
+          --model "$EDITOR_MODEL" \
+          --max-tokens 1024 \
+          --prompt "$PROMPT")
+
+        gh pr edit "$PR_NUMBER" --body "$NEW_BODY"
