@@ -668,7 +668,7 @@ impl Editor {
             return Ok(SaveOutcome::Conflict);
         }
         let bytes = self.encoded_bytes();
-        std::fs::write(&self.path, &bytes)?;
+        crate::viewer::write_replacing_symlink(&self.path, &bytes)?;
         self.original_bytes = bytes;
         self.dirty = false;
         self.external_changed = false;
