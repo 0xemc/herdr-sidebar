@@ -62,7 +62,10 @@ fn scratch_dir() -> PathBuf {
 
 /// Write `contents` to `path`, refusing to follow a pre-existing symlink at
 /// that location (defense in depth alongside `scratch_dir`'s 0700 perms).
-fn write_scratch_file(path: &Path, contents: &str) -> std::io::Result<()> {
+pub(crate) fn write_replacing_symlink(
+    path: &Path,
+    contents: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
     if std::fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
@@ -800,7 +803,7 @@ fn apply_pending(
 
 fn restore_current_control(control: &Path, current: &Option<Request>) {
     if let Some(request) = current {
-        let _ = write_scratch_file(control, &request_payload(request));
+        let _ = write_replacing_symlink(control, request_payload(request));
     }
 }
 
@@ -815,6 +818,7 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
         "--stat".into(),
         "--patch".into(),
         "--no-ext-diff".into(),
+        "--end-of-options".into(),
         spec.to_string(),
     ];
     if let Some(p) = path {
@@ -2169,7 +2173,7 @@ pub fn open_in_pane(
 
     // 1. Already open — jump to it, pinned or not.
     if let Some(p) = preview_for_doc(&previews, doc_key) {
-        write_scratch_file(&p.control, payload).map_err(|e| format!("preview failed: {e}"))?;
+        write_replacing_symlink(&p.control, payload).map_err(|e| format!("preview failed: {e}"))?;
         remember_origin(&p.pane_id, &origin_tab_id);
         if !inline {
             focus_tab_for_client(&p.tab_id, Some(&p.pane_id));
@@ -2184,7 +2188,7 @@ pub fn open_in_pane(
 
     // 2. Overwrite the ephemeral tab (inline: the tab's one viewer pane).
     if let Some(p) = reusable_preview(&previews, inline) {
-        write_scratch_file(&p.control, payload).map_err(|e| format!("preview failed: {e}"))?;
+        write_replacing_symlink(&p.control, payload).map_err(|e| format!("preview failed: {e}"))?;
         remember_origin(&p.pane_id, &origin_tab_id);
         if !inline {
             focus_tab_for_client(&p.tab_id, Some(&p.pane_id));
@@ -2386,7 +2390,7 @@ pub fn close_in_tab(my_pane_id: &str) {
                 .find(|preview| preview.pane_id == id)
                 .map(|preview| preview.control)
                 .unwrap_or_else(|| control_path_for_pane(&id));
-            let _ = write_scratch_file(&control, "close");
+            let _ = write_replacing_symlink(&control, "close");
         }
     }
 }
@@ -2685,7 +2689,7 @@ fn spawn_viewer_pane(
     inline: Option<InlineSpawn>,
 ) -> Result<(String, PathBuf), String> {
     let control = fresh_control_path();
-    write_scratch_file(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
+    write_replacing_symlink(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
     let layout = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": my_pane_id })).ok();
     let plan = match inline {
         Some(inline) => layout
@@ -2759,7 +2763,7 @@ fn create_viewer_tab(
     payload: &str,
 ) -> Result<(String, String, PathBuf), String> {
     let control = fresh_control_path();
-    write_scratch_file(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
+    write_replacing_symlink(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
     let workspace_id = ipc::call_text("pane.list", serde_json::json!({}))
         .map(|list| crate::launch::workspace_of(&list, my_pane_id))
         .unwrap_or_default();
@@ -3911,7 +3915,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn write_scratch_file_refuses_to_follow_a_preexisting_symlink() {
+    fn write_replacing_symlink_refuses_to_follow_a_preexisting_symlink() {
         use std::os::unix::fs::symlink;
         let dir = scratch_dir();
         let victim = dir.join(format!("aa-victim-{}.txt", std::process::id()));
@@ -3920,7 +3924,7 @@ mod tests {
         let _ = std::fs::remove_file(&link);
         symlink(&victim, &link).unwrap();
 
-        write_scratch_file(&link, "payload").unwrap();
+        write_replacing_symlink(&link, "payload").unwrap();
 
         // The symlink must have been replaced by a real file, and the
         // victim it used to point at must be untouched.
@@ -3938,6 +3942,40 @@ mod tests {
 
         let _ = std::fs::remove_file(&victim);
         let _ = std::fs::remove_file(&link);
+    }
+
+    #[test]
+    fn load_show_does_not_let_spec_be_read_as_a_git_option() {
+        let dir = std::env::temp_dir().join(format!("herdr-load-show-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(dir.join("file.txt"), "hello\n").unwrap();
+        git(&["add", "file.txt"]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        // A normal spec still works with the --end-of-options guard in place.
+        let doc = load_show(&dir, "HEAD", None);
+        assert!(doc.lines.iter().any(|l| l.to_string().contains("init")));
+
+        // A spec shaped like a git flag must never be parsed as one — it
+        // should surface as a git error, not act on the flag (e.g. write
+        // the file an --output=<path> flag would have named).
+        let sneaky_output = dir.join("sneaky-output-should-not-exist");
+        let sneaky_spec = format!("--output={}", sneaky_output.display());
+        load_show(&dir, &sneaky_spec, None);
+        assert!(!sneaky_output.exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
